@@ -5,6 +5,8 @@ Reads queued events from all sources, scores via RedSage on LM Studio.
 Designed to run as a scheduled launchd job every 10 minutes.
 """
 
+from __future__ import annotations
+
 import json
 import os
 import re
