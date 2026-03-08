@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Install:   cp com.velociraptor.llm-triage.plist ~/Library/LaunchAgents/
+             launchctl load ~/Library/LaunchAgents/com.velociraptor.llm-triage.plist
+  Uninstall: launchctl unload ~/Library/LaunchAgents/com.velociraptor.llm-triage.plist
+             rm ~/Library/LaunchAgents/com.velociraptor.llm-triage.plist
+-->
+<plist version="1.0">
+<dict>
+
+    <key>Label</key>
+    <string>com.velociraptor.llm-triage</string>
+
+    <!-- setup.sh patches this path automatically -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/python3</string>
+        <string>/Users/YOUR_USERNAME/velociraptor-triage/triage_daemon.py</string>
+    </array>
+
+    <!-- Fire every 10 minutes -->
+    <key>StartInterval</key>
+    <integer>600</integer>
+
+    <key>StandardOutPath</key>
+    <string>/Users/YOUR_USERNAME/velociraptor-triage/launchd_stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/YOUR_USERNAME/velociraptor-triage/launchd_stderr.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin</string>
+    </dict>
+
+    <key>KeepAlive</key>
+    <false/>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+</dict>
+</plist>

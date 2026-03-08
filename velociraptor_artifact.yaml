@@ -1,0 +1,91 @@
+name: Custom.MacOS.LLMTriage.EventCollector
+description: |
+  Watches persistence paths and suspicious process launches.
+  Writes events as JSON lines to the shared triage queue.
+  Works alongside FileMonitor and ProcessMonitor for full coverage.
+  
+  NOTE: Process monitoring uses psinfo() which is a one-time snapshot.
+  For continuous process monitoring, use Objective-See ProcessMonitor instead.
+
+type: CLIENT_EVENT
+
+parameters:
+  - name: QueueFile
+    default: /Users/YOUR_USERNAME/velociraptor-triage/event_queue.jsonl
+    description: Path to the shared event queue file (will be patched by setup.sh)
+
+  - name: WatchPaths
+    type: csv
+    default: |
+      Path
+      /Users/YOUR_USERNAME/Library/LaunchAgents
+      /Library/LaunchAgents
+      /Library/LaunchDaemons
+      /private/etc/cron.d
+      /private/etc/periodic
+      /var/at/tabs
+    description: Persistence paths to monitor for file changes
+
+sources:
+  - name: FileEvents
+    query: |
+      -- Use glob to check persistence paths (inotify is Linux-only)
+      -- This runs once when the artifact executes
+      LET file_events = SELECT * FROM foreach(row=WatchPaths,
+        query={
+          SELECT OSPath, Info, timestamp(epoch=now()) AS ts
+          FROM glob(globs=Path)
+        })
+
+      SELECT * FROM foreach(row=file_events,
+        query={
+          SELECT timestamp(epoch=now()) AS timestamp
+          FROM scope()
+          WHERE log(
+            message=serialize(item=dict(
+              source="velociraptor",
+              timestamp=timestamp,
+              event_type="file_system_event",
+              path=str(OSPath),
+              process="velociraptor-watcher",
+              user=username(),
+              signing_status="n/a",
+              raw=dict(name=OSPath.Basename, type="CREATED", dirname=str(OSPath.Dirname))
+            ), format="json") + "\n",
+            dedup_period=30,
+            file=QueueFile
+          )
+        }
+      )
+
+  - name: ProcessEvents
+    query: |
+      -- One-time snapshot of running processes (not continuous monitoring)
+      -- For real-time process monitoring, use Objective-See ProcessMonitor
+      LET suspicious = SELECT * FROM psinfo()
+      WHERE (
+        Exe =~ "/(bash|zsh|sh|python3?)$" AND NOT Name =~ "Terminal|iTerm|Code|ssh"
+      ) OR (
+        Exe =~ "/(curl|wget)$" AND NOT Name =~ "Terminal|iTerm|brew"
+      )
+
+      SELECT * FROM foreach(row=suspicious,
+        query={
+          SELECT timestamp(epoch=now()) AS timestamp
+          FROM scope()
+          WHERE log(
+            message=serialize(item=dict(
+              source="velociraptor",
+              timestamp=timestamp,
+              event_type="suspicious_process",
+              path=Exe,
+              process=Cmdline,
+              user=username(),
+              signing_status="n/a",
+              raw=dict(pid=Pid, ppid=Ppid, exe=Exe, cmdline=Cmdline)
+            ), format="json") + "\n",
+            dedup_period=60,
+            file=QueueFile
+          )
+        }
+      )
