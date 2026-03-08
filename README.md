@@ -76,6 +76,7 @@ That's it. Overwatch runs in the background, waits for your Mac to be idle, then
 | **Velociraptor** | https://github.com/Velocidex/velociraptor | ⚠️ Optional |
 | **FileMonitor** | https://objective-see.org/products/filemonitor.html | ⚠️ Optional |
 | **ProcessMonitor** | https://objective-see.org/products/processmonitor.html | ⚠️ Optional |
+| **OSINT Reporter** | https://github.com/ahsan3274/osint-reporter | ⚠️ Optional |
 
 > **M1 16GB RAM note:** RedSage at Q4_K_M quantization uses ~6–7 GB of unified memory while running. It is unloaded between triage runs, so your other tools get their memory back.
 
@@ -276,6 +277,233 @@ log show --predicate 'process == "python3"' --last 1h | grep triage
 
 ---
 
+## OSINT Integration
+
+Overwatch can optionally integrate with **[OSINT Reporter](https://github.com/ahsan3274/osint-reporter)** to provide real-time threat intelligence context to the AI triage model. This helps the model correlate local events with active global threat campaigns.
+
+> **Note:** This integration is **100% optional**. Overwatch works perfectly without OSINT Reporter — the triage daemon will simply run without external threat context.
+
+### How It Works
+
+```
+OSINT Reporter → osint_ingester.py → triage_daemon.py → LM Studio
+     │                                      │
+     └─→ Cyber events (CVEs, APTs, malware) ─┘
+```
+
+The ingester:
+1. Reads latest OSINT reports from `~/osint-reporter/output/`
+2. Extracts **only cybersecurity content** (ignores geopolitics, finance)
+3. Compresses into ~1000 token context (rolling 48h window)
+4. Injects into triage prompts for enriched risk scoring
+
+### Setup
+
+```bash
+# 1. Install OSINT Reporter (optional)
+git clone https://github.com/ahsan3274/osint-reporter
+# Configure and run OSINT Reporter per its README
+
+# 2. Copy OSINT ingester to triage directory
+cp /path/to/Overwatch/osint_ingester.py ~/velociraptor-triage/
+
+# 3. That's it! Integration is automatic.
+#    If osint_ingester.py is not present, triage runs without OSINT context.
+```
+
+### Configuration
+
+Edit `osint_ingester.py` to customize:
+
+```python
+# Rolling window: how far back to look for intel
+INTEL_WINDOW_HOURS = 48  # Last 48 hours
+
+# Compression settings
+MAX_INTEL_ITEMS = 20     # Max threat items to include
+MAX_CVE_COUNT = 10       # Max CVEs to list
+MAX_TOKENS_ESTIMATE = 2000  # Target max tokens
+
+# Categories to include
+RELEVANT_CATEGORIES = {"cybersecurity", "tech_ai"}
+```
+
+### Example OSINT Context
+
+When the triage daemon runs, it includes context like:
+
+```
+═══ OSINT THREAT CONTEXT ═══
+Window: Last 48h | Events: 20 | CVEs: 1
+
+ACTIVE THREATS:
+  • Threat Actors: APT28, Transparent Tribe
+  • Active CVEs: CVE-2025-38617
+
+INTEL SUMMARY: APT28 is running a rapid-iteration implant campaign 
+against Ukrainian targets with novel fileless tooling. Transparent 
+Tribe has operationalized AI-assisted malware factories...
+
+TOP EVENTS:
+  1. [r/netsec] A Race Within A Race: Exploiting CVE-2025-38617...
+  2. [r/cybersecurity] Cisco Catalyst SD WAN just got hit...
+═══ END OSINT CONTEXT ═══
+```
+
+### Benefits
+
+| Without OSINT | With OSINT |
+|---------------|------------|
+| Scores events in isolation | Correlates with active campaigns |
+| Generic threat categories | Specific APT/TTP attribution |
+| Static risk assessment | Context-aware scoring (CVE matches boost score) |
+
+### Monitoring
+
+```bash
+# View cached OSINT context
+cat ~/velociraptor-triage/osint_context.json | python3 -m json.tool
+
+# Check OSINT state (processed events)
+cat ~/velociraptor-triage/osint_state.json
+
+# Manual refresh
+python3 ~/velociraptor-triage/osint_ingester.py
+```
+
+---
+
+## Alerting
+
+Overwatch includes an **alerter daemon** that watches for flagged events and sends real-time notifications via multiple channels.
+
+### Quick Start
+
+```bash
+# 1. Install alerting system
+bash setup_alerting.sh
+
+# 2. Configure channels
+nano ~/velociraptor-triage/alert_config.yaml
+
+# 3. Done! Alerter runs automatically in background.
+```
+
+### Supported Channels
+
+| Channel | Description | Setup Required |
+|---------|-------------|----------------|
+| **macOS Notification** | System notification with sound | None |
+| **Terminal** | Inline colored alerts | None |
+| **Slack** | Webhook to Slack channel | Webhook URL |
+| **Discord** | Webhook to Discord channel | Webhook URL |
+| **Email** | SMTP email alerts | SMTP credentials |
+
+### Configuration
+
+Edit `~/velociraptor-triage/alert_config.yaml`:
+
+```yaml
+# Enable/disable channels
+channels:
+  macos_notification: true
+  terminal: true
+  slack: false
+  discord: false
+  email: false
+
+# Slack webhook
+slack:
+  webhook_url: "https://hooks.slack.com/services/XXX"
+  channel: "#security-alerts"
+  username: "Overwatch"
+
+# Discord webhook
+discord:
+  webhook_url: "https://discord.com/api/webhooks/XXX"
+  username: "Overwatch"
+
+# Email (SMTP)
+email:
+  smtp_server: "smtp.gmail.com"
+  smtp_port: 587
+  username: "your-email@gmail.com"
+  password: "app-password-here"
+  from_addr: "your-email@gmail.com"
+  to_addrs:
+    - "admin@example.com"
+  use_tls: true
+
+# Alert thresholds
+thresholds:
+  min_risk_score: 7          # Only alert for score >= 7
+  alert_on_levels:
+    - "HIGH"
+    - "CRITICAL"
+```
+
+### Getting Webhook URLs
+
+**Slack:**
+1. Go to your Slack workspace
+2. Create a new incoming webhook: https://your-workspace.slack.com/apps/manage/custom-integrations
+3. Choose #security-alerts channel
+4. Copy the webhook URL
+
+**Discord:**
+1. Go to your Discord server settings
+2. Integrations → Webhooks → New Webhook
+3. Choose channel and copy URL
+
+**Email (Gmail):**
+1. Enable 2FA on your Google account
+2. Generate an App Password: https://myaccount.google.com/apppasswords
+3. Use the app password (not your regular password)
+
+### Manual Testing
+
+```bash
+# Run alerter manually (foreground)
+python3 ~/velociraptor-triage/alerter_daemon.py
+
+# Trigger a test alert (add a fake HIGH-risk event)
+echo '{"flagged": true, "assessment": {"risk_score": 9, "risk_level": "CRITICAL", "category": "test", "explanation": "Test alert", "recommended_action": "Ignore"}, "original_event": {"source": "test", "event_type": "test", "path": "/test", "timestamp": "2026-03-08T00:00:00Z"}}' >> ~/velociraptor-triage/scored_events.jsonl
+```
+
+### View Alert Logs
+
+```bash
+# Real-time alert log
+tail -f ~/velociraptor-triage/alerts.log
+
+# Check alerter status
+launchctl list | grep alerter
+```
+
+### Alert Example
+
+When a HIGH-risk event is detected, you'll see:
+
+**Terminal:**
+```
+🚨 OVERWATCH ALERT 🚨
+Title: 🚨 HIGH: Malware Detection
+Message: filemonitor detected file_event
+Risk: 7/10 - HIGH
+Category: malware detection
+Time: 2026-03-08T12:34:56Z
+```
+
+**macOS Notification:**
+- System notification with "Hero" sound
+- Title and message displayed
+
+**Slack/Discord:**
+- Formatted embed with risk score, level, category
+- Explanation and recommended action
+
+---
+
 ## File Reference
 
 ### Project Files
@@ -283,10 +511,14 @@ log show --predicate 'process == "python3"' --last 1h | grep triage
 ```
 overwatch/
 ├── setup.sh                          # One-time installer
+├── setup_alerting.sh                 # Alerting system installer
 ├── triage_daemon.py                  # Core scoring daemon
+├── alerter_daemon.py                 # Alert notification daemon
+├── osint_ingester.py                 # OSINT threat intel ingester
 ├── run_filemonitor.sh                # FileMonitor → queue pipe
 ├── run_processmonitor.sh             # ProcessMonitor → queue pipe
 ├── com.velociraptor.llm-triage.plist # launchd job (10-min schedule)
+├── com.velociraptor.alerter.plist    # launchd job for alerter
 ├── velociraptor_artifact.yaml        # VQL artifact for Velociraptor
 └── README.md                         # This file
 ```
@@ -296,18 +528,28 @@ overwatch/
 ```
 ~/velociraptor-triage/
 ├── triage_daemon.py                  # Copy of daemon script
+├── alerter_daemon.py                 # Copy of alerter script
+├── osint_ingester.py                 # Copy of OSINT ingester
 ├── run_filemonitor.sh                # Copy of FileMonitor pipe
 ├── run_processmonitor.sh             # Copy of ProcessMonitor pipe
 ├── velociraptor_artifact.yaml        # Patched copy with your username
+├── alert_config.yaml                 # Alerting configuration (YAML)
 ├── event_queue.jsonl                 # Incoming events (all sources)
 ├── scored_events.jsonl               # Output: scored + flagged events
 ├── processed.jsonl                   # Archive of processed events
+├── osint_context.json                # Cached OSINT threat context
+├── osint_state.json                  # Processed OSINT event hashes
 ├── dedup_cache.jsonl                 # Fingerprint cache (5-min window)
+├── alert_state.json                  # Track already-alerted events
 ├── last_run.json                     # Timestamp of last successful run
 ├── triage_daemon.log                 # Daemon run log
+├── alerts.log                        # Alerter run log
 ├── triage.lock                       # Lock file (prevents concurrent runs)
+├── alerter.lock                      # Alerter lock file
 ├── launchd_stdout.log                # launchd stdout (when run as daemon)
-└── launchd_stderr.log                # launchd stderr (when run as daemon)
+├── launchd_stderr.log                # launchd stderr (when run as daemon)
+├── alerter_stdout.log                # Alerter stdout
+└── alerter_stderr.log                # Alerter stderr
 ```
 
 ---
@@ -378,6 +620,23 @@ launchctl unload ~/Library/LaunchAgents/com.velociraptor.llm-triage.plist
 rm ~/Library/LaunchAgents/com.velociraptor.llm-triage.plist
 rm -rf ~/velociraptor-triage
 ```
+
+---
+
+## Roadmap (Upcoming Features)
+
+These features are in development and will be added in future releases:
+
+| Feature | Description | Priority |
+|---------|-------------|----------|
+| **Auto-Remediation** | Automated response actions: quarantine files, kill malicious processes, block network connections, remove persistence | 🔥 High |
+| **Enrichment Module** | Pre-scoring enrichment: VirusTotal API, code signature validation, entitlements analysis, sandbox detection | High |
+| **SIEM Export** | Forward scored events to Splunk, Elastic, syslog, or CSV/JSON for enterprise integration | Medium |
+| **Enhanced Deduplication** | Cross-source deduplication with fuzzy matching and event correlation | Medium |
+| **Custom Rules Engine** | User-defined rules for auto-escalation, suppression, or custom scoring | Medium |
+| **Behavioral Baselines** | Learn normal system behavior to reduce false positives over time | Low |
+
+> **Note:** A **Web Dashboard** with real-time alert viewing, triage queue management, and OSINT visualization is available as a separate private module. Contact for access.
 
 ---
 

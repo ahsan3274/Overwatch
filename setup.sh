@@ -47,10 +47,16 @@ fi
 echo "[4/5] Checking Python dependencies..."
 python3 -c "import requests" 2>/dev/null && python3 -c "import psutil" 2>/dev/null && echo "   Dependencies already installed" || {
     echo "   Installing dependencies..."
-    pip3 install requests psutil --quiet --break-system-packages 2>/dev/null || {
+    if pip3 install requests psutil --quiet --break-system-packages 2>/dev/null; then
+        echo "   Dependencies installed successfully"
+    elif pip3 install requests psutil --user 2>/dev/null; then
+        echo "   Dependencies installed with --user flag"
+    else
         echo "   ⚠️  Could not install dependencies automatically."
-        echo "   Run: pip3 install requests psutil --user"
-    }
+        echo "   Please run manually:"
+        echo "   pip3 install requests psutil --user"
+        exit 1
+    fi
 }
 echo "   Dependencies: requests, psutil"
 

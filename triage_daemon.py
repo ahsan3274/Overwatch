@@ -26,6 +26,14 @@ try:
 except ImportError:
     HAS_PSUTIL = False
 
+# Try to import OSINT ingester (optional)
+try:
+    import osint_ingester
+    HAS_OSINT = True
+except ImportError:
+    HAS_OSINT = False
+    osint_ingester = None  # type: ignore
+
 # ── Config ────────────────────────────────────────────────────────────────────
 
 LM_STUDIO_URL  = "http://localhost:1234/v1/chat/completions"
@@ -336,15 +344,33 @@ Analyze the security event and respond ONLY with valid JSON in this exact format
   "explanation": "<one sentence explanation>",
   "recommended_action": "<one sentence action>"
 }
-Do not include any text outside the JSON object."""
+Do not include any text outside the JSON object.
+
+Consider the OSINT threat context below when scoring - events matching active threat campaigns, CVEs, or TTPs should receive elevated risk scores."""
 
 def get_utc_timestamp() -> str:
     """Return current UTC timestamp in ISO format with Z suffix."""
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+def get_osint_context() -> str:
+    """Get OSINT threat context if available."""
+    if not HAS_OSINT or osint_ingester is None:
+        return ""
+    
+    try:
+        prompt = osint_ingester.get_osint_prompt_for_triage()
+        return prompt
+    except Exception as e:
+        log.warning(f"Failed to load OSINT context: {e}")
+        return ""
+
+
 def build_prompt(event: dict) -> str:
-    return f"""Analyze this macOS security event:
+    # Get OSINT context
+    osint_context = get_osint_context()
+    
+    base_prompt = f"""Analyze this macOS security event:
 
 Source: {event.get('source', 'unknown')}
 Event type: {event.get('event_type', 'unknown')}
@@ -356,6 +382,12 @@ Timestamp: {event.get('timestamp', 'unknown')}
 Raw: {json.dumps(event.get('raw', {}), indent=2)}
 
 Return only the JSON risk assessment."""
+    
+    # Prepend OSINT context if available
+    if osint_context:
+        return osint_context + base_prompt
+    
+    return base_prompt
 
 # ── Deduplication ─────────────────────────────────────────────────────────────
 
@@ -430,7 +462,14 @@ def add_multiple_to_dedup_cache(events: list[dict]):
 # ── Normalizers ───────────────────────────────────────────────────────────────
 
 def normalize_filemonitor(raw: dict) -> dict:
-    """Normalize Objective-See FileMonitor JSON output."""
+    """Normalize Objective-See FileMonitor JSON output.
+    
+    Idempotent: safe to run multiple times on already-normalized events.
+    """
+    # Check if already normalized
+    if raw.get("source") == "filemonitor" and "raw" in raw:
+        return raw
+    
     event = raw.get("event", {})
     process = raw.get("process", {})
     file_info = event.get("file", {}) or event.get("destFile", {})
@@ -446,7 +485,14 @@ def normalize_filemonitor(raw: dict) -> dict:
     }
 
 def normalize_processmonitor(raw: dict) -> dict:
-    """Normalize Objective-See ProcessMonitor JSON output."""
+    """Normalize Objective-See ProcessMonitor JSON output.
+    
+    Idempotent: safe to run multiple times on already-normalized events.
+    """
+    # Check if already normalized
+    if raw.get("source") == "processmonitor" and "raw" in raw:
+        return raw
+    
     process = raw.get("process", {})
     return {
         "source":         "processmonitor",
@@ -460,7 +506,13 @@ def normalize_processmonitor(raw: dict) -> dict:
     }
 
 def normalize_velociraptor(raw: dict) -> dict:
-    """Velociraptor events are already in our schema — pass through."""
+    """Velociraptor events are already in our schema — pass through.
+    
+    Idempotent: safe to run multiple times on already-normalized events.
+    """
+    # Check if already normalized
+    if raw.get("source") == "velociraptor" and "raw" in raw:
+        return raw
     return raw
 
 NORMALIZERS = {
