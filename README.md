@@ -78,7 +78,7 @@ That's it. Overwatch runs in the background, waits for your Mac to be idle, then
 | **ProcessMonitor** | https://objective-see.org/products/processmonitor.html | ⚠️ Optional |
 | **OSINT Reporter** | https://github.com/ahsan3274/osint-reporter | ⚠️ Optional |
 
-> **M1 16GB RAM note:** RedSage at Q4_K_M quantization uses ~6–7 GB of unified memory while running. It is unloaded between triage runs, so your other tools get their memory back.
+
 
 ---
 
@@ -236,7 +236,7 @@ Edit `~/velociraptor-triage/triage_daemon.py` to customize:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `BATCH_BASE` | `40` | Base batch size (for M1 16GB) |
+| `BATCH_BASE` | `40` | Base batch size |
 | `BATCH_MIN` | `10` | Minimum events per run |
 | `BATCH_MAX` | `60` | Maximum events per run |
 
