@@ -1,6 +1,6 @@
 # Overwatch
 
-**Local AI-powered threat triage for macOS.** Collects security events from three sources, deduplicates them, and scores each one using RedSage running in LM Studio — all on-device, no cloud, no agents phoning home.
+**Local AI-powered threat detection and auto-remediation for macOS.** Collects security events from multiple sources, deduplicates them, scores each one using RedSage running in LM Studio, and can automatically remediate threats — all on-device, no cloud, no agents phoning home.
 
 ---
 
@@ -16,7 +16,31 @@ lms get redsage-qwen3-8b-dpo
 # 3. Done! The daemon runs automatically every 10 minutes.
 ```
 
-That's it. Overwatch runs in the background, waits for your Mac to be idle, then scores security events using AI. Zero manual intervention needed.
+That's it. Overwatch runs in the background, waits for your Mac to be idle, then scores security events using AI and can auto-remediate threats. Zero manual intervention needed.
+
+---
+
+## What's New (Latest Update)
+
+### 🚀 Auto-Remediation
+- **Automated threat response** — Quarantine files, kill malicious processes, block network connections
+- **Persistence removal** — Automatically remove malicious launch agents, login items, and startup scripts
+- **Configurable actions** — Enable/disable specific remediation types via config
+
+### 🔧 LM Studio Management Improvements
+- **Skip-if-loaded optimization** — Prevents redundant model loads (saves 60+ seconds per run)
+- **Auto-unload when done** — Frees RAM immediately after processing completes
+- **Better error handling** — Retry logic with graceful fallbacks
+
+### 🎯 Enhanced Event Filtering
+- **Trusted process filtering** — Skip 80-90% of noise from system processes
+- **Trusted path filtering** — Ignore events from known-safe locations
+- **Time-based deduplication** — Suppress duplicate events within 5-second window
+- **Centralized monitor management** — Single script to start/stop/status all monitors
+
+---
+
+## Architecture
 
 ---
 
@@ -53,16 +77,17 @@ That's it. Overwatch runs in the background, waits for your Mac to be idle, then
          └───────────┬─────────────┘
                      │
                      ▼
-         scored_events.jsonl
-         (flagged: risk ≥ 7)
+         scored_events.jsonl ──────► auto_remediation.py
+         (flagged: risk ≥ 7)        (quarantine, kill, block)
 ```
 
 **Key design decisions:**
-- ✅ **Zero RAM at rest** — LM Studio loads only when needed
+- ✅ **Zero RAM at rest** — LM Studio loads only when needed, unloads after use
 - ✅ **Intelligent scheduling** — defers during peak usage, accelerates when idle
-- ✅ **Dynamic batching** — processes 10-60 events based on system load
+- ✅ **Dynamic batching** — processes 50-200 events based on system load
 - ✅ **Shared queue** — all three sources use one dedup layer
 - ✅ **All local** — no cloud, no telemetry
+- ✅ **Auto-remediation** — automated threat response with configurable actions
 
 ---
 
@@ -77,8 +102,9 @@ That's it. Overwatch runs in the background, waits for your Mac to be idle, then
 | **FileMonitor** | https://objective-see.org/products/filemonitor.html | ⚠️ Optional |
 | **ProcessMonitor** | https://objective-see.org/products/processmonitor.html | ⚠️ Optional |
 | **OSINT Reporter** | https://github.com/ahsan3274/osint-reporter | ⚠️ Optional |
+| **BlockBlock** | https://objective-see.org/products/blockblock.html | ⚠️ Optional |
 
-> **M1 16GB RAM note:** RedSage at Q4_K_M quantization uses ~6–7 GB of unified memory while running. It is unloaded between triage runs, so your other tools get their memory back.
+> **M1 16GB RAM note:** RedSage at Q4_K_M quantization uses ~6–7 GB of unified memory while running. The model is now automatically unloaded after each triage run, so your other tools get their memory back immediately.
 
 ---
 
@@ -97,6 +123,8 @@ bash setup.sh
 3. Register the launchd job (fires every 10 minutes)
 4. Install Python dependencies (`requests`, `psutil`)
 5. Patch the VQL artifact with your username
+6. Set up auto-remediation directories and configurations
+7. Install BlockBlock exception script (if BlockBlock is installed)
 
 ### Step 2: Download RedSage Model
 
@@ -127,7 +155,11 @@ Overwatch works with just the daemon (queue-based), but you can add real-time ev
 Install launchd jobs to start monitors automatically on login:
 
 ```bash
-bash install_monitors.sh
+# Install monitor launchd jobs
+sudo bash install_monitors.sh
+
+# Or use the monitor manager for runtime control
+sudo bash ~/velociraptor-triage/monitor_manager.sh start
 ```
 
 This installs:
@@ -136,7 +168,7 @@ This installs:
 
 Monitors run in background and pipe events to the triage queue automatically.
 
-### Manual Start
+### Monitor Management
 
 Use the monitor manager to control monitors:
 
@@ -162,6 +194,7 @@ sudo bash ~/velociraptor-triage/monitor_manager.sh cleanup
 - ✅ Automatically cleans up orphaned python filter processes
 - ✅ Checks if monitors are already running before starting
 - ✅ Shows real-time status and queue size
+- ✅ Centralized control for all monitor operations
 
 ### Manual Start (Legacy)
 
@@ -285,9 +318,19 @@ Edit `~/velociraptor-triage/triage_daemon.py` to customize:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `BATCH_BASE` | `40` | Base batch size (for M1 16GB) |
-| `BATCH_MIN` | `10` | Minimum events per run |
-| `BATCH_MAX` | `60` | Maximum events per run |
+| `BATCH_BASE` | `100` | Base batch size (for high-volume processing) |
+| `BATCH_MIN` | `50` | Minimum events per run |
+| `BATCH_MAX` | `200` | Maximum events per run |
+
+### Auto-Remediation
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `AUTO_REMEDIATE` | `True` | Enable automatic remediation |
+| `QUARANTINE_DIR` | `~/velociraptor-triage/quarantine/` | Where to move suspicious files |
+| `KILL_MALICIOUS_PROCS` | `True` | Terminate malicious processes |
+| `BLOCK_NETWORK` | `True` | Block network access for threats |
+| `REMOVE_PERSISTENCE` | `True` | Remove malicious launch agents/items |
 
 ### Deduplication
 
@@ -563,14 +606,19 @@ overwatch/
 ├── setup_alerting.sh                 # Alerting system installer
 ├── triage_daemon.py                  # Core scoring daemon
 ├── alerter_daemon.py                 # Alert notification daemon
+├── auto_remediation.py               # Auto-remediation engine (NEW)
 ├── osint_ingester.py                 # OSINT threat intel ingester
-├── lmstudio_manager.py               # LM Studio model manager
+├── lmstudio_manager.py               # LM Studio model manager (IMPROVED)
 ├── monitor_manager.sh                # Monitor process manager (NEW)
 ├── run_filemonitor.sh                # FileMonitor → queue pipe (filtered)
 ├── run_processmonitor.sh             # ProcessMonitor → queue pipe (filtered)
+├── add_blockblock_exception.sh       # BlockBlock exception helper (NEW)
 ├── com.velociraptor.llm-triage.plist # launchd job (10-min schedule)
 ├── com.velociraptor.alerter.plist    # launchd job for alerter
+├── com.velociraptor.filemonitor.plist# FileMonitor daemon (NEW)
+├── com.velociraptor.processmonitor.plist # ProcessMonitor daemon (NEW)
 ├── velociraptor_artifact.yaml        # VQL artifact for Velociraptor
+├── FILEMONITOR_SETUP.md              # FileMonitor setup guide (NEW)
 └── README.md                         # This file
 ```
 
@@ -580,6 +628,7 @@ overwatch/
 ~/velociraptor-triage/
 ├── triage_daemon.py                  # Copy of daemon script
 ├── alerter_daemon.py                 # Copy of alerter script
+├── auto_remediation.py               # Copy of auto-remediation script
 ├── osint_ingester.py                 # Copy of OSINT ingester
 ├── run_filemonitor.sh                # Copy of FileMonitor pipe
 ├── run_processmonitor.sh             # Copy of ProcessMonitor pipe
@@ -600,16 +649,30 @@ overwatch/
 ├── launchd_stdout.log                # launchd stdout (when run as daemon)
 ├── launchd_stderr.log                # launchd stderr (when run as daemon)
 ├── alerter_stdout.log                # Alerter stdout
-└── alerter_stderr.log                # Alerter stderr
+├── alerter_stderr.log                # Alerter stderr
+└── quarantine/                       # Quarantined files (auto-remediation)
 ```
 
 ---
 
 ## Troubleshooting
 
+### "Model timed out" or "LM Studio timed out after 60s"
+
+This can happen if the model is slow to respond or the server is busy. The updated `lmstudio_manager.py` now:
+- Skips redundant model loads (saves 60+ seconds)
+- Properly checks if model is already loaded before attempting load
+- Auto-unloads when processing is complete
+
+If you still see timeouts:
+```python
+# Edit ~/velociraptor-triage/triage_daemon.py
+REQUEST_TIMEOUT_SEC = 120  # Default: 60
+```
+
 ### "Insufficient RAM" in logs
 
-The daemon detected less than 4GB free RAM and deferred processing. This is normal — it will run when your system is more idle.
+The daemon detected less than 4GB free RAM and deferred processing. This is normal — it will run when your system is more idle. The model is now automatically unloaded after each run to free memory.
 
 To lower the threshold (not recommended):
 ```python
@@ -680,12 +743,20 @@ These features are in development and will be added in future releases:
 
 | Feature | Description | Priority |
 |---------|-------------|----------|
-| **Auto-Remediation** | Automated response actions: quarantine files, kill malicious processes, block network connections, remove persistence | 🔥 High |
 | **Enrichment Module** | Pre-scoring enrichment: VirusTotal API, code signature validation, entitlements analysis, sandbox detection | High |
 | **SIEM Export** | Forward scored events to Splunk, Elastic, syslog, or CSV/JSON for enterprise integration | Medium |
 | **Enhanced Deduplication** | Cross-source deduplication with fuzzy matching and event correlation | Medium |
 | **Custom Rules Engine** | User-defined rules for auto-escalation, suppression, or custom scoring | Medium |
 | **Behavioral Baselines** | Learn normal system behavior to reduce false positives over time | Low |
+
+### ✅ Recently Completed
+
+| Feature | Description | Status |
+|---------|-------------|--------|
+| **Auto-Remediation** | Automated response: quarantine, kill processes, block network, remove persistence | ✅ Released |
+| **LM Studio Optimization** | Skip-if-loaded, auto-unload, better error handling | ✅ Released |
+| **Enhanced Filtering** | Trusted process/path filtering, time-based deduplication | ✅ Released |
+| **Monitor Manager** | Centralized control for FileMonitor/ProcessMonitor | ✅ Released |
 
 > **Note:** A **Web Dashboard** with real-time alert viewing, triage queue management, and OSINT visualization is available as a separate private module. Contact for access.
 
