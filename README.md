@@ -1,6 +1,6 @@
 # Overwatch
 
-**Local AI-powered threat detection and auto-remediation for macOS.** Collects security events from multiple sources, deduplicates them, scores each one using RedSage running in LM Studio, and can automatically remediate threats — all on-device, no cloud, no agents phoning home.
+**Local automated threat detection and response for macOS.** Collects security events from multiple sources, deduplicates them, and scores each one using RedSage running in LM Studio — all on-device, no cloud, no agents phoning home.
 
 ---
 
@@ -16,7 +16,7 @@ lms get redsage-qwen3-8b-dpo
 # 3. Done! The daemon runs automatically every 10 minutes.
 ```
 
-That's it. Overwatch runs in the background, waits for your Mac to be idle, then scores security events using AI and can auto-remediate threats. Zero manual intervention needed.
+That's it. Overwatch runs in the background, waits for your Mac to be idle, then scores security events using local LLM models and can auto-remediate threats. Zero manual intervention needed.
 
 ---
 
@@ -296,7 +296,7 @@ Start LM Studio → Load model → Score events → Unload model
 
 Edit `~/velociraptor-triage/triage_daemon.py` to customize:
 
-### AI Settings
+### Model Settings
 
 | Variable | Default | Description |
 |----------|---------|-------------|
@@ -371,7 +371,7 @@ log show --predicate 'process == "python3"' --last 1h | grep triage
 
 ## OSINT Integration
 
-Overwatch can optionally integrate with **[OSINT Reporter](https://github.com/ahsan3274/osint-reporter)** to provide real-time threat intelligence context to the AI triage model. This helps the model correlate local events with active global threat campaigns.
+Overwatch can optionally integrate with **[OSINT Reporter](https://github.com/ahsan3274/osint-reporter)** to provide real-time threat intelligence context to the triage model. This helps the model correlate local events with active global threat campaigns.
 
 > **Note:** This integration is **100% optional**. Overwatch works perfectly without OSINT Reporter — the triage daemon will simply run without external threat context.
 
