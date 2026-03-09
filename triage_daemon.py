@@ -223,9 +223,9 @@ def get_memory_usage() -> dict:
 def get_user_idle_time() -> float:
     """Get seconds since last user activity (keyboard/mouse)."""
     try:
-        # Use ioreg to get idle time on macOS
+        # Use ioreg to get idle time on macOS (use absolute path for launchd compatibility)
         result = subprocess.run(
-            ["ioreg", "-c", "IOHIDSystem"],
+            ["/usr/sbin/ioreg", "-c", "IOHIDSystem"],
             capture_output=True, text=True, timeout=5
         )
         for line in result.stdout.split("\n"):
