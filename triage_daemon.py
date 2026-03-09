@@ -68,6 +68,9 @@ EXCLUDED_PATHS = [
     "/Users/ahsan/.lmstudio/",
     "/Users/ahsan/.qwen/",
     "/Users/ahsan/Library/Application Support/Notesnook/",  # Verified signed app
+    "/Users/ahsan/Library/Application Support/LM Studio/",  # LM Studio cache files
+    "/Users/ahsan/Library/Application Support/Mullvad VPN/",  # Mullvad VPN cache
+    "/Users/ahsan/Library/Application Support/BraveSoftware/",  # Brave Browser data
     "/Users/ahsan/Library/Caches/",  # User cache directory
     "/Users/ahsan/Library/Containers/",  # App sandbox containers
     "/Users/ahsan/Library/Logs/",  # System logs
@@ -81,13 +84,16 @@ EXCLUDED_PATHS = [
     "/Applications/LuLu.app/",
     "/Applications/BlockBlock Helper.app/",
     "/Applications/Notesnook.app/",  # Trusted app
+    "/Applications/LM Studio.app/",  # LM Studio application
+    "/Applications/Mullvad VPN.app/",  # Mullvad VPN application
     "/usr/bin/",
     "/bin/",
     "/usr/lib/",
     "/System/",
     "/private/var/folders/",  # macOS temp folders
-    "/tmp/",  # Temp files
+    "/tmp/",  # Temp files (malware often lands here - monitor but don't alert)
     "/dev/",  # Device files
+    "/",  # Root path (too broad)
 ]
 
 # Skip these event types (too noisy, low security value)

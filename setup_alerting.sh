@@ -106,7 +106,7 @@ cat > "$BASE_DIR/com.velociraptor.alerter.plist" << 'EOF'
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
-        <string>/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin</string>
+        <string>/Users/$USERNAME/.lmstudio/bin:/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin</string>
     </dict>
 
     <key>KeepAlive</key>

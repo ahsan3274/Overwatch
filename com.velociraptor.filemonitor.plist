@@ -31,7 +31,9 @@
         <string>/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin</string>
     </dict>
 
-    <!-- KeepAlive removed: script is long-running, KeepAlive caused duplicate instances -->
+    <key>KeepAlive</key>
+    <true/>
+
     <key>RunAtLoad</key>
     <true/>
 
