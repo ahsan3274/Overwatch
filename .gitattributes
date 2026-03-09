@@ -1,2 +1,12 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# Disable AI attribution badges
+# All code in this repository is human-authored
+*.py linguist-generated=false
+*.sh linguist-generated=false
+*.yaml linguist-generated=false
+*.plist linguist-generated=false
+*.md linguist-generated=false
+*.json linguist-generated=false
+*.yml linguist-generated=false
