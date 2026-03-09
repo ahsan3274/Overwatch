@@ -21,8 +21,7 @@
         <key>HOME</key>
         <string>/Users/YOUR_USERNAME</string>
     </dict>
-    <key>KeepAlive</key>
-    <true/>
+    <!-- KeepAlive removed: script is long-running, KeepAlive caused duplicate instances -->
     <key>RunAtLoad</key>
     <true/>
 </dict>

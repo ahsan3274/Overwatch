@@ -31,21 +31,9 @@
         <string>/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin</string>
     </dict>
 
-    <key>KeepAlive</key>
-    <true/>
-
+    <!-- KeepAlive removed: script is long-running, KeepAlive caused duplicate instances -->
     <key>RunAtLoad</key>
     <true/>
-
-    <key>ThrottleInterval</key>
-    <integer>60</integer>
-
-    <!-- FileMonitor requires root for Endpoint Security API -->
-    <key>LimitLoadToSessionType</key>
-    <array>
-        <string>Aqua</string>
-        <string>Background</string>
-    </array>
 
 </dict>
 </plist>
