@@ -34,6 +34,14 @@ except ImportError:
     HAS_OSINT = False
     osint_ingester = None  # type: ignore
 
+# Try to import LM Studio Manager (optional - falls back to inline implementation)
+try:
+    import lmstudio_manager
+    HAS_LMSTUDIO_MANAGER = True
+except ImportError:
+    HAS_LMSTUDIO_MANAGER = False
+    lmstudio_manager = None  # type: ignore
+
 # ── Config ────────────────────────────────────────────────────────────────────
 
 LM_STUDIO_URL  = "http://localhost:1234/v1/chat/completions"
@@ -48,10 +56,55 @@ LOCK_FILE      = BASE_DIR / "triage.lock"
 LOG_FILE       = BASE_DIR / "triage_daemon.log"
 LAST_RUN_FILE  = BASE_DIR / "last_run.json"  # Track last successful run time
 
-MAX_EVENTS_PER_RUN  = 40      # Reduced for M1 16GB (fits in 10-min window)
-REQUEST_TIMEOUT_SEC = 90      # Increased for slower events
+MAX_EVENTS_PER_RUN  = 200     # Increased for high-volume processing
+REQUEST_TIMEOUT_SEC = 60      # Reduced timeout for faster failures
 RISK_THRESHOLD      = 7       # >= this score triggers HIGH flag
 DEDUP_WINDOW_SEC    = 300     # ignore duplicate events within 5 minutes
+
+# ── Exclusions (False Positive Reduction) ─────────────────────────────────────
+
+# Skip events from these paths (trusted locations)
+EXCLUDED_PATHS = [
+    "/Users/ahsan/.lmstudio/",
+    "/Users/ahsan/.qwen/",
+    "/Users/ahsan/Library/Application Support/Notesnook/",  # Verified signed app
+    "/Users/ahsan/Library/Caches/",  # User cache directory
+    "/Users/ahsan/Library/Containers/",  # App sandbox containers
+    "/Users/ahsan/Library/Logs/",  # System logs
+    "/Users/ahsan/Library/Saved Application State/",  # App state
+    "/Users/ahsan/velociraptor-triage/",  # Our own triage directory
+    "/Users/root/velociraptor-triage/",  # Our own triage directory (root)
+    "/Applications/Xcode.app/",
+    "/Applications/Visual Studio Code.app/",
+    "/Applications/FileMonitor.app/",
+    "/Applications/ProcessMonitor.app/",
+    "/Applications/LuLu.app/",
+    "/Applications/BlockBlock Helper.app/",
+    "/Applications/Notesnook.app/",  # Trusted app
+    "/usr/bin/",
+    "/bin/",
+    "/usr/lib/",
+    "/System/",
+    "/private/var/folders/",  # macOS temp folders
+    "/tmp/",  # Temp files
+    "/dev/",  # Device files
+]
+
+# Skip these event types (too noisy, low security value)
+EXCLUDED_EVENT_TYPES = [
+    "file_open",
+    "file_close",
+    "file_stat",
+    "file_read",
+    "directory_enumeration",
+]
+
+# Skip processes from these paths
+EXCLUDED_PROCESSES = [
+    "/usr/bin/",
+    "/bin/",
+    "/System/",
+]
 
 # ── LM Studio CLI ─────────────────────────────────────────────────────────────
 
@@ -64,13 +117,13 @@ LM_STUDIO_STARTUP_TIMEOUT = 30  # Max seconds to wait for LM Studio to start
 # System load thresholds (0-100 scale)
 LOAD_THRESHOLD_PROCESS = 40    # Start processing if load < this
 LOAD_THRESHOLD_DEFER = 70      # Defer if load > this
-MAX_DEFER_TIME_SEC = 1800      # Max defer time (30 min) - forces processing
-MIN_IDLE_TIME_SEC = 120        # User must be idle for at least this long
+MAX_DEFER_TIME_SEC = 300       # Max defer time (5 min) - forces processing
+MIN_IDLE_TIME_SEC = 60         # User must be idle for at least this long
 
 # Dynamic batch sizing
-BATCH_MIN = 10                 # Minimum events per run
-BATCH_MAX = 60                 # Maximum events per run
-BATCH_BASE = 40                # Base batch size for M1 16GB
+BATCH_MIN = 50                 # Minimum events per run
+BATCH_MAX = 200                # Maximum events per run
+BATCH_BASE = 100               # Base batch size for high-volume processing
 
 # Resource thresholds
 RAM_MIN_FREE_GB = 4            # Need at least this much free RAM
@@ -421,7 +474,7 @@ def save_dedup_cache(cache: dict):
 
 def deduplicate(events: list[dict]) -> tuple[list[dict], int]:
     """Filter out events whose fingerprints are in the cache.
-    
+
     Returns unique events and count of skipped duplicates.
     Note: Does NOT modify the cache - caller must add fingerprints after successful scoring.
     """
@@ -434,6 +487,38 @@ def deduplicate(events: list[dict]) -> tuple[list[dict], int]:
             continue
         unique.append(event)
     return unique, skipped
+
+
+def is_excluded(event: dict) -> bool:
+    """
+    Check if event should be excluded (false positive reduction).
+    
+    Checks:
+    1. Path in EXCLUDED_PATHS
+    2. Event type in EXCLUDED_EVENT_TYPES
+    3. Process in EXCLUDED_PROCESSES
+    
+    Returns True if event should be excluded.
+    """
+    path = event.get("path", "")
+    event_type = event.get("event_type", "")
+    process = event.get("process", "")
+    
+    # Check excluded paths
+    for excluded in EXCLUDED_PATHS:
+        if path.startswith(excluded):
+            return True
+    
+    # Check excluded event types
+    if event_type in EXCLUDED_EVENT_TYPES:
+        return True
+    
+    # Check excluded processes
+    for excluded in EXCLUDED_PROCESSES:
+        if process.startswith(excluded):
+            return True
+    
+    return False
 
 
 def add_to_dedup_cache(event: dict):
@@ -463,24 +548,45 @@ def add_multiple_to_dedup_cache(events: list[dict]):
 
 def normalize_filemonitor(raw: dict) -> dict:
     """Normalize Objective-See FileMonitor JSON output.
-    
+
     Idempotent: safe to run multiple times on already-normalized events.
+    Handles both old format (event.process) and new format (file.process).
+    
+    Returns None for events that should be excluded (CLOSE, OPEN - too noisy).
     """
     # Check if already normalized
     if raw.get("source") == "filemonitor" and "raw" in raw:
         return raw
-    
-    event = raw.get("event", {})
-    process = raw.get("process", {})
-    file_info = event.get("file", {}) or event.get("destFile", {})
+
+    # New format: file.process, event is a string
+    event_data = raw.get("file", {})
+    process_info = event_data.get("process", {})
+    destination = event_data.get("destination", "unknown")
+    event_type_raw = raw.get("event", "unknown")
+
+    # Filter out high-volume, low-value events EARLY
+    event_type_str = str(event_type_raw).lower()
+    if "close" in event_type_str or "open" in event_type_str:
+        return None  # Skip these entirely
+
+    # Get signing status from nested structure
+    signing_info = process_info.get("signing info (computed)", {})
+    signing_status = "unknown"
+    if isinstance(signing_info, dict):
+        sig_status = signing_info.get("signatureStatus")
+        if sig_status == 0:
+            signing_status = "signed"
+        elif sig_status is not None:
+            signing_status = "unsigned"
+
     return {
         "source":         "filemonitor",
         "timestamp":      get_utc_timestamp(),
-        "event_type":     f"file_{raw.get('type','event').lower()}",
-        "path":           file_info.get("path", "unknown"),
-        "process":        process.get("path", "unknown"),
-        "user":           str(process.get("uid", "unknown")),
-        "signing_status": process.get("signingInfo", {}).get("signatureStatus", "unknown"),
+        "event_type":     f"file_{event_type_str.split('_')[-1]}",
+        "path":           destination,
+        "process":        process_info.get("path", {}).get("name", "unknown") if isinstance(process_info.get("path"), dict) else str(process_info.get("path", "unknown")),
+        "user":           str(process_info.get("uid", "unknown")),
+        "signing_status": signing_status,
         "raw":            raw,
     }
 
@@ -529,11 +635,92 @@ def normalize(event: dict) -> dict:
 # ── LM Studio ─────────────────────────────────────────────────────────────────
 
 def is_lm_studio_running() -> bool:
+    """Check if LM Studio server is running via CLI status command."""
     try:
-        r = requests.get("http://localhost:1234/v1/models", timeout=3)
-        return r.status_code == 200
-    except requests.exceptions.ConnectionError:
+        result = subprocess.run(
+            [LM_STUDIO_CLI, "server", "status"],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        # Status output is on stderr: "The server is running on port 1234."
+        output = (result.stdout + result.stderr).lower()
+        return result.returncode == 0 and ("running" in output or "port" in output)
+    except (subprocess.SubprocessError, FileNotFoundError):
         return False
+
+
+def get_loaded_models() -> list[dict]:
+    """Get list of currently loaded models using 'lms ps --json'."""
+    try:
+        result = subprocess.run(
+            [LM_STUDIO_CLI, "ps", "--json"],
+            capture_output=True,
+            text=True,
+            timeout=10
+        )
+        if result.returncode != 0:
+            return []
+        
+        data = json.loads(result.stdout)
+        if isinstance(data, list):
+            return data
+        elif isinstance(data, dict) and "models" in data:
+            return data["models"]
+    except (subprocess.SubprocessError, json.JSONDecodeError, FileNotFoundError):
+        pass
+    
+    return []
+
+
+def is_model_loaded() -> bool:
+    """Check if the required model is already loaded in LM Studio."""
+    loaded = get_loaded_models()
+    if not loaded:
+        return False
+    
+    # Check if our model is loaded (by identifier or path)
+    for model in loaded:
+        identifier = model.get("identifier", "") or model.get("id", "")
+        path = model.get("path", "")
+        
+        if LM_STUDIO_MODEL in identifier or MODEL_NAME in identifier or \
+           LM_STUDIO_MODEL in path or MODEL_NAME in path:
+            log.info(f"Model '{LM_STUDIO_MODEL}' already loaded")
+            return True
+    
+    log.warning(f"LM Studio running but model '{LM_STUDIO_MODEL}' not loaded")
+    log.warning(f"Loaded models: {[m.get('identifier', m.get('id', '?')) for m in loaded]}")
+    return False
+
+
+def unload_all_models() -> bool:
+    """Unload all currently loaded models."""
+    loaded = get_loaded_models()
+    if not loaded:
+        log.debug("No models to unload")
+        return True
+    
+    log.info(f"Unloading {len(loaded)} model(s)...")
+    
+    # Use --all flag to unload everything at once
+    try:
+        result = subprocess.run(
+            [LM_STUDIO_CLI, "unload", "-a"],
+            capture_output=True,
+            text=True,
+            timeout=30
+        )
+        if result.returncode == 0:
+            time.sleep(2)  # Wait for unload to complete
+            log.info("All models unloaded successfully")
+            return True
+        else:
+            log.warning(f"Batch unload failed: {result.stderr}")
+    except Exception as e:
+        log.warning(f"Failed to unload models: {e}")
+    
+    return False
 
 
 def is_lm_studio_cli_available() -> bool:
@@ -554,40 +741,74 @@ def start_lm_studio_server() -> bool:
     """Start LM Studio server in background using CLI."""
     try:
         log.info("Starting LM Studio server via CLI...")
-        # Start server in background (detached)
-        subprocess.Popen(
+        result = subprocess.run(
             [LM_STUDIO_CLI, "server", "start", "--port", "1234"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True
+            capture_output=True,
+            text=True,
+            timeout=10
         )
-        return True
+        if result.returncode != 0:
+            log.error(f"Failed to start server: {result.stderr}")
+            return False
+        
+        # Wait for server to be ready
+        log.info("Waiting for server to be ready...")
+        for _ in range(30):
+            time.sleep(1)
+            if is_lm_studio_running():
+                log.info("Server is ready")
+                return True
+        
+        log.error("Server did not become ready in time")
+        return False
     except (subprocess.SubprocessError, FileNotFoundError) as e:
         log.error(f"Failed to start LM Studio server: {e}")
         return False
 
 
 def load_lm_studio_model() -> bool:
-    """Load the RedSage model into LM Studio."""
+    """
+    Load the RedSage model into LM Studio.
+    Unloads any existing models first to avoid conflicts.
+    
+    Note: 'lms load' is a long-running command that stays active while the model
+    is loaded. We run it in background and poll for the model to appear.
+    """
+    # First unload any existing models
+    unload_all_models()
+    
     try:
         log.info(f"Loading model '{LM_STUDIO_MODEL}'...")
-        # Use 'lms load' command (not 'lms model load')
-        result = subprocess.run(
-            [LM_STUDIO_CLI, "load", LM_STUDIO_MODEL],
-            capture_output=True,
-            text=True,
-            timeout=LM_STUDIO_STARTUP_TIMEOUT
+        
+        # Load with appropriate options for triage use
+        # --ttl: Auto-unload after 5 min of inactivity (saves resources)
+        # --context-length: Reasonable context window for security events
+        # Run in background since 'lms load' is a long-running command
+        subprocess.Popen(
+            [
+                LM_STUDIO_CLI, "load", LM_STUDIO_MODEL,
+                "--ttl", "300",
+                "--context-length", "4096",
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True
         )
-        if result.returncode == 0:
-            log.info("Model loaded successfully")
-            return True
-        else:
-            log.error(f"Failed to load model: {result.stderr}")
-            return False
-    except subprocess.TimeoutExpired:
-        log.error(f"Model load timed out after {LM_STUDIO_STARTUP_TIMEOUT}s")
+        
+        # Wait for model to fully load
+        log.info(f"Waiting for model to load (timeout: {LM_STUDIO_STARTUP_TIMEOUT}s)...")
+        start = time.time()
+        
+        while time.time() - start < LM_STUDIO_STARTUP_TIMEOUT:
+            if is_model_loaded():
+                log.info(f"Model '{LM_STUDIO_MODEL}' loaded successfully")
+                return True
+            time.sleep(1)
+        
+        log.error(f"Model '{LM_STUDIO_MODEL}' did not load within {LM_STUDIO_STARTUP_TIMEOUT}s")
         return False
-    except (subprocess.SubprocessError, FileNotFoundError) as e:
+        
+    except Exception as e:
         log.error(f"Failed to load model: {e}")
         return False
 
@@ -606,53 +827,80 @@ def wait_for_lm_studio(timeout: int = LM_STUDIO_STARTUP_TIMEOUT) -> bool:
 
 
 def stop_lm_studio_server() -> bool:
-    """Stop LM Studio server and unload model."""
+    """Stop LM Studio server (models auto-unload when server stops)."""
     try:
         log.info("Stopping LM Studio server...")
-        subprocess.run(
+        result = subprocess.run(
             [LM_STUDIO_CLI, "server", "stop"],
             capture_output=True,
-            timeout=10
+            text=True,
+            timeout=30
         )
-        log.info("LM Studio server stopped")
-        return True
+        if result.returncode == 0:
+            log.info("LM Studio server stopped")
+            return True
+        else:
+            log.warning(f"Failed to stop server: {result.stderr}")
+            return False
     except (subprocess.SubprocessError, FileNotFoundError) as e:
         log.warning(f"Failed to stop LM Studio server: {e}")
         return False
 
 
-def ensure_lm_studio_ready() -> bool:
+def ensure_lm_studio_ready(max_retries: int = 2) -> bool:
     """
     Ensure LM Studio server is running and model is loaded.
+    
+    Uses lmstudio_manager module if available, otherwise falls back to
+    inline implementation.
+
     Returns True if ready, False if failed.
     """
-    # Check if already running
-    if is_lm_studio_running():
-        log.info("LM Studio server already running")
-        return True
+    # Prefer using lmstudio_manager if available
+    if HAS_LMSTUDIO_MANAGER:
+        log.info("Using lmstudio_manager module")
+        if lmstudio_manager.ensure_model_loaded(MODEL_NAME, retry=True):
+            return True
+        log.warning("lmstudio_manager failed, falling back to inline implementation")
     
-    # Check if CLI is available
-    if not is_lm_studio_cli_available():
-        log.error("LM Studio CLI (lms) not found. Please install LM Studio.")
-        log.error("Download from: https://lmstudio.ai")
-        return False
-    
-    # Start server
-    if not start_lm_studio_server():
-        return False
-    
-    # Wait for server to be ready
-    if not wait_for_lm_studio():
-        return False
-    
-    # Load model
-    if not load_lm_studio_model():
-        return False
-    
-    # Wait for model to load (additional time)
-    time.sleep(2)
-    
-    return True
+    # Fallback to inline implementation
+    for attempt in range(1, max_retries + 1):
+        log.info(f"LM Studio check (attempt {attempt}/{max_retries})...")
+
+        # Check if server is running
+        if not is_lm_studio_running():
+            log.info("LM Studio server not running")
+            # Check if CLI is available
+            if not is_lm_studio_cli_available():
+                log.error("LM Studio CLI (lms) not found. Please install LM Studio.")
+                log.error("Download from: https://lmstudio.ai")
+                return False
+
+            # Start server
+            if not start_lm_studio_server():
+                log.warning(f"Failed to start server (attempt {attempt})")
+                continue
+
+            log.info("LM Studio server started")
+        else:
+            log.info("LM Studio server already running")
+
+        # Check if model is already loaded (PREVENT DUPLICATE LOADS)
+        if is_model_loaded():
+            log.info("Model already loaded, skipping load")
+            return True
+
+        # Load model
+        if load_lm_studio_model():
+            return True
+
+        log.warning(f"Model load failed (attempt {attempt}/{max_retries})")
+        if attempt < max_retries:
+            log.info("Retrying in 5 seconds...")
+            time.sleep(5)
+
+    log.error(f"Failed to ensure LM Studio ready after {max_retries} attempts")
+    return False
 
 def score_event(event: dict) -> dict | None:
     payload = {
@@ -848,7 +1096,20 @@ def main():
 
         log.info(f"Read {len(raw_events)} raw event(s) from queue.")
 
-        normalized = [normalize(e) for e in raw_events]
+        # Normalize events (filter out None returns from excluded normalizations)
+        normalized = [n for e in raw_events if (n := normalize(e)) is not None]
+
+        # Apply exclusions (false positive reduction)
+        before_exclude = len(normalized)
+        normalized = [
+            e for e in normalized
+            if not is_excluded(e)
+        ]
+        excluded_count = before_exclude - len(normalized)
+        if excluded_count > 0:
+            log.info(f"Excluded {excluded_count} events (trusted paths/processes)")
+        
+        # Deduplicate remaining events
         unique, skipped = deduplicate(normalized)
         log.info(f"After dedup: {len(unique)} unique, {skipped} skipped.")
 
@@ -914,8 +1175,12 @@ def main():
         # Save successful run time
         save_last_run_time(time.time())
 
-        # Only stop LM Studio if we started it (don't interrupt user's session)
-        if not lm_studio_was_running:
+        # Unload model to free RAM (use manager if available)
+        if HAS_LMSTUDIO_MANAGER:
+            lmstudio_manager.unload_model_when_done(MODEL_NAME)
+            log.info("Model unloaded via lmstudio_manager")
+        elif not lm_studio_was_running:
+            # Fallback: stop server if we started it
             stop_lm_studio_server()
         else:
             log.debug("LM Studio was already running - leaving it active")

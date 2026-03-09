@@ -78,7 +78,7 @@ That's it. Overwatch runs in the background, waits for your Mac to be idle, then
 | **ProcessMonitor** | https://objective-see.org/products/processmonitor.html | ⚠️ Optional |
 | **OSINT Reporter** | https://github.com/ahsan3274/osint-reporter | ⚠️ Optional |
 
-
+> **M1 16GB RAM note:** RedSage at Q4_K_M quantization uses ~6–7 GB of unified memory while running. It is unloaded between triage runs, so your other tools get their memory back.
 
 ---
 
@@ -122,11 +122,57 @@ python3 ~/velociraptor-triage/triage_daemon.py
 
 Overwatch works with just the daemon (queue-based), but you can add real-time event sources:
 
+### Auto-Start Monitors (Recommended)
+
+Install launchd jobs to start monitors automatically on login:
+
+```bash
+bash install_monitors.sh
+```
+
+This installs:
+- **FileMonitor** - File system events (create, write, delete)
+- **ProcessMonitor** - Process launch events (if installed)
+
+Monitors run in background and pipe events to the triage queue automatically.
+
+### Manual Start
+
+Use the monitor manager to control monitors:
+
+```bash
+# Start all monitors (with automatic orphan cleanup)
+sudo bash ~/velociraptor-triage/monitor_manager.sh start
+
+# Stop all monitors
+sudo bash ~/velociraptor-triage/monitor_manager.sh stop
+
+# Restart all monitors
+sudo bash ~/velociraptor-triage/monitor_manager.sh restart
+
+# Check status
+bash ~/velociraptor-triage/monitor_manager.sh status
+
+# Cleanup orphaned/duplicate processes
+sudo bash ~/velociraptor-triage/monitor_manager.sh cleanup
+```
+
+**Why use monitor_manager.sh?**
+- ✅ Prevents duplicate FileMonitor/ProcessMonitor instances
+- ✅ Automatically cleans up orphaned python filter processes
+- ✅ Checks if monitors are already running before starting
+- ✅ Shows real-time status and queue size
+
+### Manual Start (Legacy)
+
 ### FileMonitor (File Events)
 
 ```bash
 # Install to /Applications/, then run:
 bash ~/velociraptor-triage/run_filemonitor.sh
+
+# Or in background:
+nohup bash ~/velociraptor-triage/run_filemonitor.sh > /tmp/filemonitor.log 2>&1 &
 ```
 
 Monitors: file create, write, delete operations.
@@ -136,6 +182,9 @@ Monitors: file create, write, delete operations.
 ```bash
 # Install to /Applications/, then run:
 bash ~/velociraptor-triage/run_processmonitor.sh
+
+# Or in background:
+nohup bash ~/velociraptor-triage/run_processmonitor.sh > /tmp/processmonitor.log 2>&1 &
 ```
 
 Monitors: process launches, exec chains.
@@ -236,7 +285,7 @@ Edit `~/velociraptor-triage/triage_daemon.py` to customize:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `BATCH_BASE` | `40` | Base batch size |
+| `BATCH_BASE` | `40` | Base batch size (for M1 16GB) |
 | `BATCH_MIN` | `10` | Minimum events per run |
 | `BATCH_MAX` | `60` | Maximum events per run |
 
@@ -515,8 +564,10 @@ overwatch/
 ├── triage_daemon.py                  # Core scoring daemon
 ├── alerter_daemon.py                 # Alert notification daemon
 ├── osint_ingester.py                 # OSINT threat intel ingester
-├── run_filemonitor.sh                # FileMonitor → queue pipe
-├── run_processmonitor.sh             # ProcessMonitor → queue pipe
+├── lmstudio_manager.py               # LM Studio model manager
+├── monitor_manager.sh                # Monitor process manager (NEW)
+├── run_filemonitor.sh                # FileMonitor → queue pipe (filtered)
+├── run_processmonitor.sh             # ProcessMonitor → queue pipe (filtered)
 ├── com.velociraptor.llm-triage.plist # launchd job (10-min schedule)
 ├── com.velociraptor.alerter.plist    # launchd job for alerter
 ├── velociraptor_artifact.yaml        # VQL artifact for Velociraptor

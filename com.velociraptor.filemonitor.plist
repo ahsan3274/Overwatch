@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  FileMonitor launchd job
+  Installs:   cp com.velociraptor.filemonitor.plist ~/Library/LaunchAgents/
+              launchctl load ~/Library/LaunchAgents/com.velociraptor.filemonitor.plist
+  Uninstalls: launchctl unload ~/Library/LaunchAgents/com.velociraptor.filemonitor.plist
+              rm ~/Library/LaunchAgents/com.velociraptor.filemonitor.plist
+-->
+<plist version="1.0">
+<dict>
+
+    <key>Label</key>
+    <string>com.velociraptor.filemonitor</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/YOUR_USERNAME/velociraptor-triage/run_filemonitor.sh</string>
+    </array>
+
+    <key>StandardOutPath</key>
+    <string>/Users/YOUR_USERNAME/velociraptor-triage/filemonitor_stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/YOUR_USERNAME/velociraptor-triage/filemonitor_stderr.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin</string>
+    </dict>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>ThrottleInterval</key>
+    <integer>60</integer>
+
+    <!-- FileMonitor requires root for Endpoint Security API -->
+    <key>LimitLoadToSessionType</key>
+    <array>
+        <string>Aqua</string>
+        <string>Background</string>
+    </array>
+
+</dict>
+</plist>

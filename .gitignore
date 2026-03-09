@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+ENV/
+env/
+*.egg-info/
+dist/
+build/
+
+# Triage runtime files (generated at runtime)
+*.lock
+*.jsonl
+*.log
+last_run.json
+alert_state.json
+osint_context.json
+osint_state.json
+dedup_cache.jsonl
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# LM Studio
+.lmstudio/
