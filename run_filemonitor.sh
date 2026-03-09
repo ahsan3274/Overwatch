@@ -8,7 +8,7 @@
 # ─────────────────────────────────────────────────────────────────────────────
 
 FILEMONITOR="/Applications/FileMonitor.app/Contents/MacOS/FileMonitor"
-QUEUE="$HOME/velociraptor-triage/event_queue.jsonl"
+QUEUE="/Users/ahsan/velociraptor-triage/event_queue.jsonl"
 
 if [ ! -f "$FILEMONITOR" ]; then
   echo "❌ FileMonitor not found at $FILEMONITOR"

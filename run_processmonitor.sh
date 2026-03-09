@@ -8,7 +8,7 @@
 # ─────────────────────────────────────────────────────────────────────────────
 
 PROCESSMONITOR="/Applications/ProcessMonitor.app/Contents/MacOS/ProcessMonitor"
-QUEUE="$HOME/velociraptor-triage/event_queue.jsonl"
+QUEUE="/Users/ahsan/velociraptor-triage/event_queue.jsonl"
 
 if [ ! -f "$PROCESSMONITOR" ]; then
   echo "❌ ProcessMonitor not found at $PROCESSMONITOR"
