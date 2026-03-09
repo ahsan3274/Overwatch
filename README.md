@@ -104,7 +104,7 @@ That's it. Overwatch runs in the background, waits for your Mac to be idle, then
 | **OSINT Reporter** | https://github.com/ahsan3274/osint-reporter | ⚠️ Optional |
 | **BlockBlock** | https://objective-see.org/products/blockblock.html | ⚠️ Optional |
 
-> **M1 16GB RAM note:** RedSage at Q4_K_M quantization uses ~6–7 GB of unified memory while running. The model is now automatically unloaded after each triage run, so your other tools get their memory back immediately.
+> **RAM note:** RedSage at Q4_K_M quantization uses ~6–7 GB of RAM while running. The model is now automatically unloaded after each triage run, so your other tools get their memory back immediately.
 
 ---
 
