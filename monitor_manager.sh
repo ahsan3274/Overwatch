@@ -44,15 +44,18 @@ find_monitor_processes() {
 
 # Count running instances
 count_filemonitor() {
-    ps aux | grep -c "[F]ileMonitor.app" 2>/dev/null || echo 0
+    local count=$(ps aux | grep "[F]ileMonitor.app" 2>/dev/null | wc -l | tr -d ' ')
+    echo "${count:-0}"
 }
 
 count_processmonitor() {
-    ps aux | grep -c "[P]rocessMonitor.app" 2>/dev/null || echo 0
+    local count=$(ps aux | grep "[P]rocessMonitor.app" 2>/dev/null | wc -l | tr -d ' ')
+    echo "${count:-0}"
 }
 
 count_python_filters() {
-    ps aux | grep -c "python.*QUEUE" 2>/dev/null || echo 0
+    local count=$(ps aux | grep "python.*QUEUE" 2>/dev/null | wc -l | tr -d ' ')
+    echo "${count:-0}"
 }
 
 # Kill all monitor processes

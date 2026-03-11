@@ -42,6 +42,14 @@ except ImportError:
     HAS_LMSTUDIO_MANAGER = False
     lmstudio_manager = None  # type: ignore
 
+# Try to import EDR ingester (optional - provides hash/YARA pre-scoring)
+try:
+    from edr import edr_ingester
+    HAS_EDR = True
+except ImportError:
+    HAS_EDR = False
+    edr_ingester = None  # type: ignore
+
 # ── Config ────────────────────────────────────────────────────────────────────
 
 LM_STUDIO_URL  = "http://localhost:1234/v1/chat/completions"
@@ -86,6 +94,7 @@ EXCLUDED_PATHS = [
     "/Applications/Notesnook.app/",  # Trusted app
     "/Applications/LM Studio.app/",  # LM Studio application
     "/Applications/Mullvad VPN.app/",  # Mullvad VPN application
+    "/Applications/Brave Browser.app/",  # Brave Browser application
     "/usr/bin/",
     "/bin/",
     "/usr/lib/",
@@ -134,6 +143,15 @@ BATCH_BASE = 100               # Base batch size for high-volume processing
 # Resource thresholds
 RAM_MIN_FREE_GB = 4            # Need at least this much free RAM
 CPU_MAX_PERCENT = 50           # Don't process if CPU > this
+
+# ── EDR Integration ───────────────────────────────────────────────────────────
+
+# EDR pre-scoring configuration (optional - provides deterministic threat detection)
+EDR_ENABLED = HAS_EDR          # Enable if edr_ingester is available
+EDR_HASH_LOOKUP = True         # Enable MalwareBazaar hash reputation lookup
+EDR_YARA_SCAN = True           # Enable YARA rule scanning
+EDR_RISK_BOOST = 3             # Risk score boost for EDR matches (added to LLM score)
+EDR_AUTO_FLAG_THRESHOLD = 8    # Auto-flag as HIGH if EDR risk >= this (skip LLM)
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 # Note: Logging is configured in configure_logging() after directory exists
@@ -908,6 +926,113 @@ def ensure_lm_studio_ready(max_retries: int = 2) -> bool:
     log.error(f"Failed to ensure LM Studio ready after {max_retries} attempts")
     return False
 
+
+# ── EDR Pre-Scoring ───────────────────────────────────────────────────────────
+
+def edr_pre_score(event: dict) -> tuple[Optional[dict], Optional[dict]]:
+    """
+    Run EDR pre-scoring on an event before LLM analysis.
+
+    This provides deterministic threat detection via:
+    1. MalwareBazaar hash reputation lookup
+    2. YARA rule scanning
+
+    Returns:
+        (edr_result, pre_scored_assessment) where:
+        - edr_result is the raw EDR result dict (or None if not detected)
+        - pre_scored_assessment is a complete assessment dict if EDR risk >= threshold
+          (allows skipping LLM for known malware)
+        - Both None if EDR not enabled or no detection
+    """
+    if not EDR_ENABLED or not edr_ingester:
+        return None, None
+
+    # Extract file path from event
+    file_path = event.get("path")
+    if not file_path or not os.path.isfile(file_path):
+        return None, None
+
+    try:
+        # Initialize EDR engine for this scan
+        engine = edr_ingester.EDREngine(
+            enable_hash_lookup=EDR_HASH_LOOKUP,
+            enable_yara=EDR_YARA_SCAN
+        )
+
+        # Scan the file
+        edr_result = engine.scan_file(file_path)
+
+        if not edr_result or not edr_result.edr_detected:
+            return None, None
+
+        # EDR detected a threat
+        log.info(f"EDR detected threat: {edr_result.malware_family or edr_result.yara_threat_category} "
+                f"(Risk: {edr_result.combined_risk_score}/10, Confidence: {edr_result.confidence})")
+
+        # Check if we should auto-flag without LLM
+        if edr_result.combined_risk_score >= EDR_AUTO_FLAG_THRESHOLD:
+            log.info(f"EDR risk >= {EDR_AUTO_FLAG_THRESHOLD}, auto-flagging as HIGH")
+            pre_scored = {
+                "risk_score": min(10, edr_result.combined_risk_score),
+                "risk_level": "HIGH" if edr_result.combined_risk_score < 10 else "CRITICAL",
+                "category": edr_result.malware_family or edr_result.yara_threat_category,
+                "explanation": f"EDR detection: {edr_result.detection_source} match. "
+                              f"Malware family: {edr_result.malware_family or 'Unknown'}. "
+                              f"Confidence: {edr_result.confidence}.",
+                "recommended_action": "Quarantine file and investigate immediately",
+                "edr_detected": True,
+                "edr_risk_score": edr_result.combined_risk_score,
+                "edr_source": edr_result.detection_source,
+            }
+            return edr_result.to_dict(), pre_scored
+
+        # EDR detected but below auto-flag threshold - return for LLM boost
+        return edr_result.to_dict(), None
+
+    except Exception as e:
+        log.warning(f"EDR pre-scoring failed: {e}")
+        return None, None
+
+
+def apply_edr_risk_boost(llm_assessment: dict, edr_result: dict) -> dict:
+    """
+    Apply EDR risk score boost to LLM assessment.
+
+    If EDR detected something (even below auto-flag threshold),
+    boost the LLM's risk score to account for deterministic detection.
+    """
+    if not edr_result:
+        return llm_assessment
+
+    # Copy assessment to avoid mutating original
+    boosted = llm_assessment.copy()
+
+    # Apply risk boost
+    original_score = boosted.get("risk_score", 0)
+    boosted_score = min(10, original_score + EDR_RISK_BOOST)
+
+    boosted["risk_score"] = boosted_score
+    boosted["edr_boosted"] = True
+    boosted["original_risk_score"] = original_score
+    boosted["edr_risk_score"] = edr_result.get("combined_risk_score", 0)
+
+    # Upgrade risk level if score crossed threshold
+    if boosted_score >= 9:
+        boosted["risk_level"] = "CRITICAL"
+    elif boosted_score >= 7 and boosted.get("risk_level") == "MEDIUM":
+        boosted["risk_level"] = "HIGH"
+
+    # Update explanation to mention EDR
+    original_explanation = boosted.get("explanation", "")
+    boosted["explanation"] = (
+        f"{original_explanation} [EDR boost: +{EDR_RISK_BOOST} for "
+        f"{edr_result.get('detection_source', 'unknown')} detection]"
+    )
+
+    log.info(f"EDR boost applied: {original_score} -> {boosted_score}")
+    return boosted
+
+
 def score_event(event: dict) -> dict | None:
     payload = {
         "model": MODEL_NAME,
@@ -1148,7 +1273,24 @@ def main():
         for i, event in enumerate(batch, 1):
             log.info(f"[{i}/{len(batch)}] {event.get('source','?')} "
                      f"{event.get('event_type','?')} — {event.get('path','?')[:60]}")
-            score = score_event(event)
+
+            # EDR pre-scoring (before LLM)
+            edr_result, pre_scored = edr_pre_score(event)
+
+            if pre_scored:
+                # EDR auto-flagged (high confidence threat - skip LLM)
+                score = pre_scored
+                log.info(f"  ⚡ EDR auto-flag: {score.get('risk_level')} (Risk: {score.get('risk_score')}/10)")
+            elif edr_result:
+                # EDR detected something but below auto-flag threshold
+                # Score with LLM and apply EDR boost
+                score = score_event(event)
+                if score:
+                    score = apply_edr_risk_boost(score, edr_result)
+            else:
+                # No EDR detection - standard LLM scoring
+                score = score_event(event)
+
             if score:
                 write_scored(event, score)
                 scored_events.append(event)  # Batch for dedup cache

@@ -33,6 +33,21 @@ chmod +x "$TRIAGE_DIR/triage_daemon.py"
 chmod +x "$TRIAGE_DIR/run_filemonitor.sh"
 chmod +x "$TRIAGE_DIR/run_processmonitor.sh"
 
+# Copy EDR module (optional - provides hash/YARA pre-scoring)
+echo "      Installing EDR module..."
+mkdir -p "$TRIAGE_DIR/edr"
+cp -r overwatch-public/edr/*.py "$TRIAGE_DIR/edr/" 2>/dev/null || {
+    # If overwatch-public/edr doesn't exist, try edr directory in root
+    if [ -d "edr" ]; then
+        cp -r edr/*.py "$TRIAGE_DIR/edr/" 2>/dev/null || true
+    fi
+}
+if [ -d "$TRIAGE_DIR/edr" ] && [ "$(ls -A $TRIAGE_DIR/edr 2>/dev/null)" ]; then
+    echo "      EDR module installed"
+else
+    echo "      EDR module not found (optional component)"
+fi
+
 # 3. Patch and install plist
 echo "[3/5] Installing launchd job..."
 sed "s|YOUR_USERNAME|$USERNAME|g" "$PLIST_SRC" > "$PLIST_DEST"
@@ -74,19 +89,24 @@ echo "1. REDSAGE (LM Studio)"
 echo "   → Open LM Studio → search 'RedSage' → Download & Load"
 echo "   → Ensure server is running on localhost:1234"
 echo ""
-echo "2. FILEMONITOR"
+echo "2. EDR MODULE (Optional - Hash/YARA pre-scoring)"
+echo "   → Install YARA: pip3 install yara-python"
+echo "   → Download rules: bash ~/velociraptor-triage/setup_edr_rules.sh"
+echo "   → Test: python3 ~/velociraptor-triage/edr/edr_ingester.py --test"
+echo ""
+echo "3. FILEMONITOR"
 echo "   → Install FileMonitor.app to /Applications/"
 echo "   → Run: bash $TRIAGE_DIR/run_filemonitor.sh"
 echo ""
-echo "3. PROCESSMONITOR"
+echo "4. PROCESSMONITOR"
 echo "   → Install ProcessMonitor.app to /Applications/"
 echo "   → Run: bash $TRIAGE_DIR/run_processmonitor.sh"
 echo ""
-echo "4. VELOCIRAPTOR"
+echo "5. VELOCIRAPTOR"
 echo "   → Dashboard → Artifacts → Upload New Artifact"
 echo "   → Upload: $TRIAGE_DIR/velociraptor_artifact.yaml"
 echo ""
-echo "5. TEST"
+echo "6. TEST"
 echo "   → python3 $TRIAGE_DIR/triage_daemon.py"
 echo ""
 echo "─── Monitor scored events ──────────────────────────"

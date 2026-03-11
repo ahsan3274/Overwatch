@@ -85,7 +85,9 @@ TRUSTED_PATHS = [
     '/usr/bin/',
     '/usr/lib/',
     '/System/',
-    '/Library/',
+    '/Library/Application Support/Apple/',  # Apple system data
+    '/Library/Developer/',  # Xcode developer tools
+    '/Library/Frameworks/',  # System frameworks
     '/var/folders/',  # macOS temp (not /tmp - malware often lands there)
     '/private/var/folders/',
     '/Applications/Xcode.app/',
@@ -94,6 +96,14 @@ TRUSTED_PATHS = [
     '/Users/ahsan/.lmstudio/',
     '/Users/ahsan/.qwen/',
     '/Users/ahsan/velociraptor-triage/',
+]
+
+# Trusted user library paths (reduce noise from common apps)
+TRUSTED_USER_PATHS = [
+    '/Users/ahsan/Library/Caches/',  # App caches
+    '/Users/ahsan/Library/Containers/',  # App sandbox data
+    '/Users/ahsan/Library/Logs/',  # System logs
+    '/Users/ahsan/Library/Saved Application State/',  # App state
 ]
 
 # Trusted event types (too noisy)
@@ -138,6 +148,14 @@ for line in sys.stdin:
         # Skip trusted paths
         skip_path = False
         for trusted in TRUSTED_PATHS:
+            if dest.startswith(trusted) or proc_path.startswith(trusted):
+                skip_path = True
+                break
+        if skip_path:
+            continue
+
+        # Skip trusted user library paths
+        for trusted in TRUSTED_USER_PATHS:
             if dest.startswith(trusted) or proc_path.startswith(trusted):
                 skip_path = True
                 break

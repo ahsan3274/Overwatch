@@ -22,6 +22,13 @@ That's it. Overwatch runs in the background, waits for your Mac to be idle, then
 
 ## What's New (Latest Update)
 
+### 🛡️ EDR Integration (NEW)
+- **MalwareBazaar hash lookup** — Real-time hash reputation checking against known malware database
+- **YARA rule scanning** — Signature-based detection using community YARA rules (LOKI, VirusTotal)
+- **Auto-flagging** — Known malware automatically flagged as HIGH risk without LLM processing
+- **Risk score boost** — EDR detections boost LLM risk scores for correlated confidence
+- **Offline caching** — Hash lookups cached locally to reduce API calls
+
 ### 🚀 Auto-Remediation
 - **Automated threat response** — Quarantine files, kill malicious processes, block network connections
 - **Persistence removal** — Automatically remove malicious launch agents, login items, and startup scripts
@@ -37,10 +44,6 @@ That's it. Overwatch runs in the background, waits for your Mac to be idle, then
 - **Trusted path filtering** — Ignore events from known-safe locations
 - **Time-based deduplication** — Suppress duplicate events within 5-second window
 - **Centralized monitor management** — Single script to start/stop/status all monitors
-
----
-
-## Architecture
 
 ---
 
@@ -63,17 +66,28 @@ That's it. Overwatch runs in the background, waits for your Mac to be idle, then
          (launchd fires every 10 min)
                     │
                     ▼
+         ┌─────────────────────────────────────┐
+         │   triage_daemon.py                  │
+         │  - Check system load                │
+         │  - Normalize events                 │
+         │  - Deduplicate                      │
+         │  - Dynamic batch sizing             │
+         │  - EDR pre-scoring (NEW)            │
+         └──────────────┬──────────────────────┘
+                        │
+           ┌────────────┼────────────┐
+           ▼            ▼            ▼
+    ┌──────────┐ ┌──────────┐ ┌──────────┐
+    │  Hash    │ │  YARA    │ │  LLM     │
+    │  Lookup  │ │  Scan    │ │  Scoring │
+    │(EDR)     │ │(EDR)     │ │(RedSage) │
+    └────┬─────┘ └────┬─────┘ └────┬─────┘
+         │            │            │
+         └────────────┼────────────┘
+                      ▼
          ┌─────────────────────────┐
-         │   triage_daemon.py      │
-         │  - Check system load    │
-         │  - Normalize events     │
-         │  - Deduplicate          │
-         │  - Dynamic batch sizing │
-         └───────────┬─────────────┘
-                     │
-         ┌───────────▼─────────────┐
-         │  LM Studio (auto-start) │
-         │  RedSage-Qwen3-8B       │
+         │  Risk Score + Flag      │
+         │  (EDR boost if match)   │
          └───────────┬─────────────┘
                      │
                      ▼
@@ -88,6 +102,7 @@ That's it. Overwatch runs in the background, waits for your Mac to be idle, then
 - ✅ **Shared queue** — all three sources use one dedup layer
 - ✅ **All local** — no cloud, no telemetry
 - ✅ **Auto-remediation** — automated threat response with configurable actions
+- ✅ **EDR pre-scoring** — deterministic threat detection before LLM (NEW)
 
 ---
 
@@ -142,6 +157,112 @@ launchctl list | grep llm-triage
 
 # Test the daemon manually
 python3 ~/velociraptor-triage/triage_daemon.py
+```
+
+---
+
+## EDR Integration (Optional)
+
+Overwatch includes optional **EDR (Endpoint Detection and Response)** capabilities that provide deterministic threat detection alongside AI-powered scoring.
+
+### What EDR Adds
+
+| Feature | Description |
+|---------|-------------|
+| **Hash Reputation** | Checks file hashes against MalwareBazaar database of known malware |
+| **YARA Scanning** | Scans files against community YARA rules (LOKI, VirusTotal) |
+| **Auto-Flagging** | Known malware automatically flagged as HIGH risk (skips LLM) |
+| **Risk Boost** | EDR detections add +3 to LLM risk score for correlated confidence |
+| **Offline Cache** | Hash lookups cached locally (24h TTL) to reduce API calls |
+
+### Quick Setup
+
+```bash
+# 1. Install yara-python (required for YARA scanning)
+pip install yara-python
+
+# 2. Download YARA rules (recommended sources)
+bash ~/velociraptor-triage/setup_edr_rules.sh
+
+# 3. That's it! EDR is automatic.
+#    Hash lookup works immediately (no API key required).
+```
+
+### EDR Data Sources
+
+| Source | Type | Setup | Coverage |
+|--------|------|-------|----------|
+| **MalwareBazaar** | Hash IOCs | Automatic (API) | Real-time malware hashes |
+| **LOKI Signatures** | YARA rules | Manual (git clone) | Curated threat signatures |
+| **VirusTotal YARA** | YARA rules | Manual (git clone) | Community rules |
+
+### Manual YARA Rules Setup
+
+```bash
+# LOKI signatures (recommended)
+git clone https://github.com/Neo23x0/Loki.git
+mkdir -p ~/velociraptor-triage/edr/yara_rules
+cp -r Loki/signature/* ~/velociraptor-triage/edr/yara_rules/
+
+# VirusTotal YARA rules
+git clone https://github.com/VirusTotal/yara-rules.git
+cp yara-rules/*.yar ~/velociraptor-triage/edr/yara_rules/
+```
+
+### Configuration
+
+Edit `~/velociraptor-triage/triage_daemon.py` to customize EDR:
+
+```python
+# EDR pre-scoring configuration
+EDR_ENABLED = True           # Enable EDR pre-scoring
+EDR_HASH_LOOKUP = True       # Enable MalwareBazaar hash lookup
+EDR_YARA_SCAN = True         # Enable YARA rule scanning
+EDR_RISK_BOOST = 3           # Risk score boost for EDR matches
+EDR_AUTO_FLAG_THRESHOLD = 8  # Auto-flag as HIGH if EDR risk >= this
+```
+
+### How EDR Works
+
+```
+Event detected (file create/modify)
+         │
+         ▼
+┌─────────────────────────┐
+│  EDR Pre-Scoring        │
+│  1. Hash lookup         │
+│  2. YARA scan           │
+└───────────┬─────────────┘
+            │
+    ┌───────┴────────┐
+    │                │
+    ▼                ▼
+EDR Match       No EDR Match
+(Risk >= 8)     (or below threshold)
+    │                │
+    ▼                ▼
+Auto-flag       LLM Scoring
+(HIGH/CRITICAL)  (RedSage)
+    │                │
+    └───────┬────────┘
+            │
+            ▼
+    Final Risk Score
+    (EDR boost applied
+     if EDR detected)
+```
+
+### Monitoring EDR
+
+```bash
+# View EDR detections in scored events
+grep "edr" ~/velociraptor-triage/scored_events.jsonl | python3 -m json.tool
+
+# Check EDR cache stats
+python3 ~/velociraptor-triage/edr/edr_ingester.py --test
+
+# View hash lookup cache
+cat ~/velociraptor-triage/threat_db/ioc_cache.sqlite | strings
 ```
 
 ---
