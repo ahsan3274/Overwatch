@@ -895,3 +895,5 @@ MIT License — use at your own risk. This is a security tool that monitors your
 - **LM Studio** — Local LLM runtime
 - **Objective-See** — FileMonitor and ProcessMonitor
 - **Velociraptor** — Endpoint visibility platform
+
+If you find this fork useful, consider supporting its development: bc1qa25wm50g9pl26xzc0fl63reqxp47e05dp64942 (BTC)
