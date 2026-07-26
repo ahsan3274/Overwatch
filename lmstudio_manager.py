@@ -1,410 +1,529 @@
 #!/usr/bin/env python3
 """
-LM Studio Manager - Robust model loading/unloading for the triage daemon.
-Handles edge cases like:
-- Multiple models loaded
-- Model already loaded (different identifier)
-- Server not running
-- CLI not available
-- Timeout handling with retries
+Overwatch LM Studio CLI Manager
+Efficient model loading/unloading via LM Studio CLI
+Loads model on-demand for threat scoring, unloads immediately after
 """
 
 from __future__ import annotations
 
 import json
+import logging
+import re
 import subprocess
 import time
-import logging
-from typing import Optional
+import requests
+from datetime import datetime
+from pathlib import Path
 
-# ── Config ────────────────────────────────────────────────────────────────────
-
-LM_STUDIO_CLI = "lms"
+# Configuration
+LM_STUDIO_URL = "http://localhost:1234/v1"
 MODEL_NAME = "redsage-qwen3-8b-dpo"
-SERVER_URL = "http://localhost:1234"
-LOAD_TIMEOUT = 60       # Seconds to wait for model load
-UNLOAD_TIMEOUT = 30     # Seconds to wait for model unload
-MAX_RETRIES = 3         # Max retries for load/unload operations
-CHECK_INTERVAL = 1      # Seconds between status checks
+LM_STUDIO_CLI = str(Path.home() / ".lmstudio" / "bin" / "lms")
+LOG_FILE = Path.home() / 'velociraptor-triage' / 'lmstudio_manager.log'
 
-log = logging.getLogger("lmstudio_manager")
+# Timeouts
+LOAD_TIMEOUT = 120  # Model loading can take time
+SCORING_TIMEOUT = 90
+MAX_RETRIES = 2
 
-
-# ── Helper Functions ──────────────────────────────────────────────────────────
-
-def run_lms_command(args: list[str], timeout: int = 30) -> tuple[bool, str, str]:
-    """
-    Run an LM Studio CLI command.
-    Returns (success, stdout, stderr).
-    """
-    try:
-        result = subprocess.run(
-            [LM_STUDIO_CLI] + args,
-            capture_output=True,
-            text=True,
-            timeout=timeout
-        )
-        return result.returncode == 0, result.stdout, result.stderr
-    except subprocess.TimeoutExpired:
-        return False, "", f"Command timed out after {timeout}s"
-    except FileNotFoundError:
-        return False, "", f"LM Studio CLI '{LM_STUDIO_CLI}' not found"
-    except Exception as e:
-        return False, "", str(e)
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler(LOG_FILE),
+        logging.StreamHandler()
+    ]
+)
+log = logging.getLogger(__name__)
 
 
-# ── Server Management ─────────────────────────────────────────────────────────
+class LMStudioCLIManager:
+    """Manages LM Studio model lifecycle via CLI for Overwatch"""
 
-def is_server_running() -> bool:
-    """Check if LM Studio server is running."""
-    success, stdout, stderr = run_lms_command(["server", "status"], timeout=5)
-    if not success:
-        return False
-    # Status output is on stderr: "The server is running on port 1234."
-    output = (stdout + stderr).lower()
-    return "running" in output or "port" in output
+    def __init__(self):
+        self.model_loaded = False
+        self.last_load_time = None
 
+    def _run_lmstudio_cli(self, command: list, timeout: int = 30) -> tuple[bool, str]:
+        """
+        Run LM Studio CLI command
 
-def start_server() -> bool:
-    """Start LM Studio server in background."""
-    log.info("Starting LM Studio server...")
-    success, stdout, stderr = run_lms_command(["server", "start", "--port", "1234"], timeout=10)
-    if not success:
-        log.error(f"Failed to start server: {stderr}")
-        return False
-    
-    # Wait for server to be ready
-    log.info("Waiting for server to be ready...")
-    for _ in range(30):
-        time.sleep(1)
-        if is_server_running():
-            log.info("Server is ready")
-            return True
-    
-    log.error("Server did not become ready in time")
-    return False
+        Args:
+            command: CLI arguments (e.g., ['models', 'load', MODEL_NAME])
+            timeout: Command timeout in seconds
 
+        Returns:
+            tuple: (success: bool, output: str)
+        """
+        try:
+            # Translate the legacy manager verbs to the current `lms` CLI.
+            if command[:2] == ['models', 'load'] and len(command) >= 3:
+                cli_args = [
+                    'load', command[2],
+                    '--identifier', MODEL_NAME,
+                    '--yes',
+                ]
+            elif command[:2] == ['models', 'unload']:
+                cli_args = ['unload', MODEL_NAME]
+            else:
+                cli_args = command
 
-def stop_server() -> bool:
-    """Stop LM Studio server."""
-    log.info("Stopping LM Studio server...")
-    success, stdout, stderr = run_lms_command(["server", "stop"], timeout=30)
-    if not success:
-        log.warning(f"Failed to stop server: {stderr}")
-        return False
-    log.info("Server stopped")
-    return True
+            result = subprocess.run(
+                [LM_STUDIO_CLI] + cli_args,
+                capture_output=True,
+                text=True,
+                timeout=timeout
+            )
 
+            if result.returncode == 0:
+                return True, result.stdout
+            else:
+                return False, result.stderr
 
-# ── Model Management ──────────────────────────────────────────────────────────
+        except FileNotFoundError:
+            log.debug("lmstudio CLI not found, trying alternative methods")
+            return False, "CLI not found"
+        except subprocess.TimeoutExpired:
+            log.error(f"CLI command timed out after {timeout}s")
+            return False, "Timeout"
+        except Exception as e:
+            log.error(f"CLI error: {e}")
+            return False, str(e)
 
-def get_loaded_models() -> list[dict]:
-    """
-    Get list of currently loaded models using 'lms ps'.
-    Returns list of dicts with 'identifier', 'path', etc.
-    """
-    success, stdout, _ = run_lms_command(["ps", "--json"], timeout=10)
-    if not success:
-        return []
-    
-    try:
-        # Parse JSON output
-        data = json.loads(stdout)
-        if isinstance(data, list):
-            return data
-        elif isinstance(data, dict) and "models" in data:
-            return data["models"]
-    except json.JSONDecodeError:
-        pass
-    
-    return []
-
-
-def unload_all_models() -> bool:
-    """Unload all currently loaded models."""
-    loaded = get_loaded_models()
-    if not loaded:
-        log.debug("No models to unload")
-        return True
-    
-    log.info(f"Unloading {len(loaded)} model(s)...")
-    
-    # Use --all flag to unload everything at once
-    success, stdout, stderr = run_lms_command(["unload", "-a"], timeout=UNLOAD_TIMEOUT)
-    if not success:
-        # Fallback: unload each model individually
-        log.warning(f"Batch unload failed: {stderr}, trying individual unloads")
-        for model in loaded:
-            identifier = model.get("identifier", "") or model.get("id", "")
-            if identifier:
-                log.info(f"Unloading model: {identifier}")
-                run_lms_command(["unload", identifier], timeout=UNLOAD_TIMEOUT)
-    
-    # Verify all models are unloaded
-    time.sleep(2)
-    remaining = get_loaded_models()
-    if remaining:
-        log.warning(f"{len(remaining)} model(s) still loaded after unload")
-        return False
-    
-    log.info("All models unloaded successfully")
-    return True
-
-
-def is_model_loaded(model_name: str = None) -> bool:
-    """
-    Check if a specific model is loaded.
-    If model_name is None, checks if ANY model is loaded.
-    """
-    loaded = get_loaded_models()
-    if not loaded:
-        return False
-    
-    if model_name is None:
-        return len(loaded) > 0
-    
-    # Check if our model is loaded (by identifier or path)
-    for model in loaded:
-        identifier = model.get("identifier", "") or model.get("id", "")
-        path = model.get("path", "")
-        
-        if model_name in identifier or model_name in path:
-            return True
-    
-    return False
-
-
-def load_model(model_name: str, wait_for_ready: bool = True, skip_if_loaded: bool = True) -> bool:
-    """
-    Load a model into LM Studio.
-
-    Note: 'lms load' is a long-running command that stays active while the model
-    is loaded. We run it in background and poll for the model to appear.
-
-    Args:
-        model_name: The model key/identifier to load
-        wait_for_ready: If True, wait for the model to be fully loaded
-        skip_if_loaded: If True, return immediately if model is already loaded
-
-    Returns:
-        True if successful, False otherwise
-    """
-    # Check if model is already loaded (skip redundant loads)
-    if skip_if_loaded and is_model_loaded(model_name):
-        log.info(f"Model '{model_name}' is already loaded, skipping load")
-        return True
-
-    log.info(f"Loading model '{model_name}'...")
-
-    # First, unload any existing models to avoid conflicts
-    # (Only if we're actually loading a new model)
-    loaded_models = get_loaded_models()
-    if loaded_models:
-        # Check if it's ONLY our model
-        if len(loaded_models) == 1:
-            identifier = loaded_models[0].get("identifier", "") or loaded_models[0].get("id", "")
-            if model_name in identifier:
-                log.info(f"Model '{model_name}' is already loaded")
-                return True
-        # Unload if different model or multiple models loaded
-        unload_all_models()
-
-    try:
-        # Load with appropriate options for triage use
-        # Using --ttl to auto-unload after inactivity
-        # Run in background since 'lms load' is long-running
-        subprocess.Popen(
-            [
-                LM_STUDIO_CLI, "load", model_name,
-                "--ttl", "300",
-                "--context-length", "4096",
-            ],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True
-        )
-
-        log.info("Model load initiated in background")
-
-        if not wait_for_ready:
-            log.info("Not waiting for model to load (wait_for_ready=False)")
-            return True
-
-        # Wait for model to be fully loaded
-        log.info(f"Waiting for model to load (timeout: {LOAD_TIMEOUT}s)...")
-        start = time.time()
-
-        while time.time() - start < LOAD_TIMEOUT:
-            if is_model_loaded(model_name):
-                log.info(f"Model '{model_name}' loaded successfully")
-                return True
-            time.sleep(CHECK_INTERVAL)
-
-        log.error(f"Model '{model_name}' did not load within {LOAD_TIMEOUT}s")
-        return False
-
-    except Exception as e:
-        log.error(f"Failed to load model: {e}")
-        return False
-
-
-def ensure_model_loaded(model_name: str, retry: bool = True) -> bool:
-    """
-    Ensure a model is loaded, with retry logic.
-
-    This is the main entry point for the triage daemon.
-    """
-    # Check if already loaded (fast path - no redundant loads)
-    if is_model_loaded(model_name):
-        log.info(f"Model '{model_name}' is already loaded")
-        return True
-
-    # Check if server is running
-    if not is_server_running():
-        log.info("LM Studio server not running, starting...")
-        if not start_server():
-            log.error("Failed to start LM Studio server")
+    def check_lmstudio_running(self) -> bool:
+        """Check if LM Studio server is running"""
+        try:
+            response = requests.get(f"{LM_STUDIO_URL}/models", timeout=5)
+            return response.status_code == 200
+        except Exception as e:
+            log.debug(f"LM Studio not responding: {e}")
             return False
 
-    # Try to load with retries
-    attempts = MAX_RETRIES if retry else 1
-    for attempt in range(1, attempts + 1):
-        log.info(f"Load attempt {attempt}/{attempts}")
+    def get_current_model(self) -> str | None:
+        """Get currently loaded model name"""
+        try:
+            response = requests.get(f"{LM_STUDIO_URL}/models", timeout=5)
+            if response.status_code == 200:
+                data = response.json()
+                if data.get('data'):
+                    return data['data'][0].get('id')
+        except Exception as e:
+            log.debug(f"Failed to get current model: {e}")
+        return None
 
-        # Pass skip_if_loaded=True to avoid unloading if model got loaded concurrently
-        if load_model(model_name, wait_for_ready=True, skip_if_loaded=True):
+    def is_correct_model_loaded(self) -> bool:
+        """Check if RedSage model is loaded"""
+        current = self.get_current_model()
+        return current == MODEL_NAME
+
+    def load_model(self) -> bool:
+        """
+        Load RedSage model via CLI
+
+        Returns:
+            bool: True if loaded successfully
+        """
+        # Check if already loaded
+        if self.is_correct_model_loaded():
+            log.info("✓ RedSage model already loaded")
+            self.model_loaded = True
+            self.last_load_time = datetime.now()
             return True
 
-        if attempt < attempts:
-            log.warning(f"Load attempt {attempt} failed, retrying in 5s...")
-            time.sleep(5)
+        log.info(f"Loading {MODEL_NAME}...")
 
-    log.error(f"Failed to load model '{model_name}' after {attempts} attempts")
-    return False
+        # Loading a model does not guarantee the OpenAI-compatible server is
+        # listening. Start it explicitly before loading so verification and
+        # scoring can use port 1234 under launchd as well as interactive runs.
+        if not self.check_lmstudio_running():
+            log.info("Starting LM Studio local server...")
+            success, output = self._run_lmstudio_cli(
+                ['server', 'start'], timeout=30
+            )
+            if not success:
+                log.error(f"Failed to start LM Studio server: {output[:200]}")
+                return False
+
+            for _ in range(30):
+                if self.check_lmstudio_running():
+                    break
+                time.sleep(1)
+            else:
+                log.error("LM Studio server did not become ready")
+                return False
+
+        # Try CLI first
+        success, output = self._run_lmstudio_cli(
+            ['models', 'load', MODEL_NAME],
+            timeout=LOAD_TIMEOUT
+        )
+
+        if success:
+            log.info(f"✓ {MODEL_NAME} loaded via CLI")
+            log.debug(f"CLI output: {output[:200]}")
+            self.model_loaded = True
+            self.last_load_time = datetime.now()
+
+            # Verify it's actually loaded
+            time.sleep(2)
+            if self.is_correct_model_loaded():
+                return True
+            else:
+                log.warning("Model load reported success but verification failed")
+                return False
+
+        # Fallback: Load via API (dummy request)
+        log.info("CLI failed, trying API fallback...")
+
+        for attempt in range(MAX_RETRIES):
+            try:
+                response = requests.post(
+                    f"{LM_STUDIO_URL}/chat/completions",
+                    json={
+                        "model": MODEL_NAME,
+                        "messages": [{"role": "user", "content": "Hi"}],
+                        "max_tokens": 1
+                    },
+                    timeout=LOAD_TIMEOUT
+                )
+
+                if response.status_code == 200:
+                    log.info(f"✓ {MODEL_NAME} loaded via API (attempt {attempt + 1})")
+                    self.model_loaded = True
+                    self.last_load_time = datetime.now()
+                    return True
+                else:
+                    log.warning(f"Load attempt {attempt + 1} failed: {response.status_code}")
+
+            except Exception as e:
+                log.warning(f"Load attempt {attempt + 1} error: {e}")
+
+            if attempt < MAX_RETRIES - 1:
+                time.sleep(2)
+
+        log.error(f"✗ Failed to load {MODEL_NAME} after {MAX_RETRIES} attempts")
+        return False
+
+    def unload_model(self, immediate: bool = True) -> bool:
+        """
+        Unload model via CLI
+
+        Args:
+            immediate: If True, use CLI for immediate unload
+
+        Returns:
+            bool: True if unloaded successfully
+        """
+        if not self.model_loaded and not self.is_correct_model_loaded():
+            log.debug("Model not loaded, nothing to unload")
+            return True
+
+        log.info("Unloading model...")
+
+        # Try CLI unload first
+        if immediate:
+            success, output = self._run_lmstudio_cli(
+                ['models', 'unload'],
+                timeout=30
+            )
+
+            if success:
+                log.info(f"✓ Model unloaded via CLI")
+                log.debug(f"CLI output: {output[:200]}")
+                self.model_loaded = False
+                self.last_load_time = None
+                return True
+            else:
+                log.warning(f"CLI unload failed: {output[:200]}")
+                # Continue to API fallback
+
+        # Fallback: API unload (if available)
+        try:
+            response = requests.post(
+                f"{LM_STUDIO_URL}/debug/unload",
+                timeout=10
+            )
+
+            if response.status_code == 200:
+                log.info("✓ Model unloaded via API")
+                self.model_loaded = False
+                self.last_load_time = None
+                return True
+        except Exception as e:
+            log.debug(f"API unload failed: {e}")
+
+        log.warning("Model unload requested but may still be in memory")
+        self.model_loaded = False
+        self.last_load_time = None
+        return True  # Return True anyway - model will be reloaded on next need
+
+    def shutdown_lmstudio(self) -> bool:
+        """Stop the local server and daemon, then quit the LM Studio GUI."""
+        success = True
+
+        log.info("Stopping LM Studio local server...")
+        server_ok, server_output = self._run_lmstudio_cli(
+            ['server', 'stop'], timeout=30
+        )
+        if not server_ok and 'not running' not in server_output.lower():
+            log.warning(f"LM Studio server stop failed: {server_output[:200]}")
+            success = False
+        elif not server_ok:
+            log.debug("LM Studio server was already stopped")
+
+        # Avoid launching LM Studio merely to ask it to quit. AppleScript first
+        # checks whether the application is already running.
+        try:
+            running = subprocess.run(
+                ['osascript', '-e', 'application "LM Studio" is running'],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            if running.returncode == 0 and running.stdout.strip() == 'true':
+                quit_result = subprocess.run(
+                    ['osascript', '-e', 'tell application "LM Studio" to quit'],
+                    capture_output=True,
+                    text=True,
+                    timeout=15,
+                )
+                if quit_result.returncode == 0:
+                    log.info("✓ LM Studio GUI quit")
+                else:
+                    log.warning(
+                        f"LM Studio GUI quit failed: {quit_result.stderr[:200]}"
+                    )
+                    success = False
+        except Exception as exc:
+            log.warning(f"Unable to check or quit LM Studio GUI: {exc}")
+            success = False
+
+        log.info("Stopping LM Studio daemon...")
+        daemon_ok, daemon_output = self._run_lmstudio_cli(
+            ['daemon', 'down'], timeout=30
+        )
+        if not daemon_ok and 'not running' not in daemon_output.lower():
+            log.warning(f"LM Studio daemon stop failed: {daemon_output[:200]}")
+            success = False
+        elif not daemon_ok:
+            log.debug("LM Studio daemon was already stopped")
+
+        if success:
+            log.info("✓ LM Studio fully stopped")
+        return success
+
+    def ensure_loaded(self) -> bool:
+        """
+        Ensure model is loaded, load if needed
+
+        Returns:
+            bool: True if model is ready for scoring
+        """
+        if self.is_correct_model_loaded():
+            self.last_load_time = datetime.now()
+            return True
+
+        return self.load_model()
+
+    def score_threat(self, event_data: dict, unload_after: bool = True) -> dict | None:
+        """
+        Score a security event using RedSage LLM
+
+        This is the main entry point for Overwatch triage.
+        Loads the model on demand and scores one event. Callers processing a
+        batch can set ``unload_after=False`` and unload once in their cleanup.
+
+        Args:
+            event_data: Event dictionary with process, network, indicators
+
+        Returns:
+            dict: Scoring result with risk_score (1-10) and reasoning
+            None: If scoring failed
+        """
+        # Load model on-demand
+        log.info("Loading model for threat scoring...")
+        if not self.ensure_loaded():
+            log.error("Cannot score: model not available")
+            return None
+
+        log.info("Model loaded, scoring threat...")
+
+        # Build prompt
+        system_prompt = """You are RedSage, a security threat scoring AI.
+Analyze the security event and provide a risk score from 1-10.
+
+Response format (JSON only):
+{
+    "risk_score": 1-10,
+    "reasoning": "Brief explanation",
+    "threat_type": "malware|backdoor|c2|miner|suspicious|benign",
+    "confidence": 0.0-1.0
+}
+
+Scoring guide:
+- 1-3: Benign system activity
+- 4-6: Suspicious but likely false positive
+- 7-8: Likely threat, investigate
+- 9-10: Confirmed threat, immediate action
+"""
+
+        event_json = json.dumps(event_data, indent=2, default=str)
+        user_prompt = f"""Security Event Analysis:
+
+{event_json}
+
+Use the complete event above. Missing fields and PID 0 mean metadata was not
+provided; they are not threat indicators. A policy-enforcement event is benign
+unless it contains independent evidence of compromise. Score this threat:"""
+
+        # Make scoring request
+        try:
+            response = requests.post(
+                f"{LM_STUDIO_URL}/chat/completions",
+                json={
+                    "model": MODEL_NAME,
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt}
+                    ],
+                    "temperature": 0.1,
+                    "max_tokens": 256
+                },
+                timeout=SCORING_TIMEOUT
+            )
+
+            if response.status_code != 200:
+                log.error(f"Scoring request failed: {response.status_code}")
+                if unload_after:
+                    self.unload_model()
+                return None
+
+            result = response.json()
+            content = result['choices'][0]['message']['content'].strip()
+
+            if unload_after:
+                log.info("Scoring complete, unloading model...")
+                self.unload_model(immediate=True)
+            else:
+                log.debug("Scoring complete; keeping model loaded for batch")
+
+            # Parse JSON response
+            try:
+                # Extract JSON from markdown code blocks if present
+                if "```" in content:
+                    json_match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', content, re.DOTALL)
+                    if json_match:
+                        content = json_match.group(1)
+                    else:
+                        json_match = re.search(r'\{[^}]+\}', content, re.DOTALL)
+                        if json_match:
+                            content = json_match.group(0)
+
+                score_result = json.loads(content)
+
+                # Validate result
+                if not isinstance(score_result, dict):
+                    log.error(f"LLM returned non-dict result: {type(score_result)}")
+                    return None
+
+                if "risk_score" not in score_result:
+                    log.error(f"LLM result missing risk_score: {score_result}")
+                    return None
+
+                risk_score = int(score_result.get("risk_score", 0))
+                if risk_score < 1 or risk_score > 10:
+                    log.error(f"Invalid risk_score {risk_score} (must be 1-10)")
+                    return None
+
+                # Extract threat type
+                threat_type = score_result.get("threat_type", "unknown")
+                if threat_type not in {"malware", "backdoor", "c2", "miner", "suspicious", "benign"}:
+                    threat_type = "unknown"
+
+                log.info(f"✓ Threat scored: {risk_score}/10 ({threat_type})")
+
+                return {
+                    "risk_score": risk_score,
+                    "threat_type": threat_type,
+                    "reasoning": score_result.get("reasoning", "No reasoning provided"),
+                    "confidence": float(score_result.get("confidence", 0.5)),
+                    "raw": score_result
+                }
+
+            except json.JSONDecodeError as e:
+                log.error(f"Failed to parse LLM response: {e}")
+                log.debug(f"Raw response: {content[:500]}")
+                return None
+
+        except requests.exceptions.Timeout:
+            log.error(f"Scoring timed out after {SCORING_TIMEOUT}s")
+            if unload_after:
+                self.unload_model()
+            return None
+        except Exception as e:
+            log.error(f"Scoring error: {e}")
+            if unload_after:
+                self.unload_model()
+            return None
+
+    def get_status(self) -> dict:
+        """Get current manager status"""
+        return {
+            'model_loaded': self.model_loaded or self.is_correct_model_loaded(),
+            'current_model': self.get_current_model(),
+            'last_load_time': self.last_load_time.isoformat() if self.last_load_time else None,
+            'lmstudio_running': self.check_lmstudio_running()
+        }
 
 
-def unload_model_when_done(model_name: str = None) -> bool:
-    """
-    Unload model after processing is complete.
-    
-    This is the companion to ensure_model_loaded() - call this when done
-    processing to free up RAM.
-    
-    Args:
-        model_name: If provided, only unload if this specific model is loaded.
-                   If None, unload any loaded model.
-    
-    Returns:
-        True if model was unloaded (or nothing to unload), False on error.
-    """
-    loaded = get_loaded_models()
-    if not loaded:
-        log.debug("No models to unload")
-        return True
-    
-    # If model_name specified, check if it's the one loaded
-    if model_name:
-        for model in loaded:
-            identifier = model.get("identifier", "") or model.get("id", "")
-            path = model.get("path", "")
-            if model_name in identifier or model_name in path:
-                log.info(f"Unloading model '{model_name}'...")
-                return unload_all_models()
-        # Model we wanted isn't loaded
-        log.debug(f"Model '{model_name}' not loaded, nothing to unload")
-        return True
-    
-    # Unload whatever is loaded
-    log.info(f"Unloading {len(loaded)} model(s)...")
-    return unload_all_models()
+# Singleton instance
+_manager = None
+
+def get_manager() -> LMStudioCLIManager:
+    """Get singleton manager instance"""
+    global _manager
+    if _manager is None:
+        _manager = LMStudioCLIManager()
+    return _manager
 
 
-def get_model_info() -> dict:
-    """Get information about the loaded model."""
-    loaded = get_loaded_models()
-    if not loaded:
-        return {"status": "no_model_loaded"}
-    
-    # Return info about the first loaded model
-    model = loaded[0]
-    return {
-        "status": "loaded",
-        "identifier": model.get("identifier", "unknown"),
-        "path": model.get("path", "unknown"),
-        "context_length": model.get("contextLength", "unknown"),
-    }
-
-
-# ── CLI Interface ─────────────────────────────────────────────────────────────
-
-if __name__ == "__main__":
+if __name__ == '__main__':
+    # Test/CLI mode
     import sys
-    
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(message)s"
-    )
-    
-    if len(sys.argv) < 2:
-        print("Usage: lmstudio_manager.py <command> [args]")
-        print("Commands:")
-        print("  status     - Show current model status")
-        print("  load       - Load the configured model (skips if already loaded)")
-        print("  unload     - Unload all models")
-        print("  done       - Unload model after processing (alias for unload)")
-        print("  restart    - Restart the server and load model")
-        print("  check      - Check if model is loaded (exit 0 if yes, 1 if no)")
-        sys.exit(1)
-    
-    command = sys.argv[1]
-    
-    if command == "status":
-        info = get_model_info()
-        print(json.dumps(info, indent=2))
-    
-    elif command == "load":
-        if ensure_model_loaded(MODEL_NAME):
-            print(f"Model '{MODEL_NAME}' loaded successfully")
-            sys.exit(0)
-        else:
-            print(f"Failed to load model '{MODEL_NAME}'")
-            sys.exit(1)
-    
-    elif command == "unload":
-        if unload_all_models():
-            print("All models unloaded")
-            sys.exit(0)
-        else:
-            print("Failed to unload models")
-            sys.exit(1)
 
-    elif command == "done":
-        # Alias for unload - unloads model when processing is done
-        if unload_model_when_done(MODEL_NAME):
-            print(f"Model '{MODEL_NAME}' unloaded")
-            sys.exit(0)
-        else:
-            print(f"Failed to unload model '{MODEL_NAME}'")
-            sys.exit(1)
+    manager = get_manager()
 
-    elif command == "restart":
-        stop_server()
-        time.sleep(2)
-        start_server()
-        if ensure_model_loaded(MODEL_NAME):
-            print(f"Server restarted and model '{MODEL_NAME}' loaded")
-            sys.exit(0)
+    print("=== Overwatch LM Studio CLI Manager ===")
+    print("")
+
+    status = manager.get_status()
+    print(f"LM Studio Running: {status['lmstudio_running']}")
+    print(f"Model Loaded: {status['model_loaded']}")
+    print(f"Current Model: {status['current_model']}")
+    print("")
+
+    if len(sys.argv) > 1:
+        if sys.argv[1] == 'load':
+            print("Loading model...")
+            if manager.load_model():
+                print("✓ Model loaded")
+            else:
+                print("✗ Failed to load")
+
+        elif sys.argv[1] == 'unload':
+            print("Unloading model...")
+            if manager.unload_model():
+                print("✓ Model unloaded")
+            else:
+                print("✗ Failed to unload")
+
+        elif sys.argv[1] == 'status':
+            print(f"Status: {status}")
+
         else:
-            sys.exit(1)
-    
-    elif command == "check":
-        if is_model_loaded(MODEL_NAME):
-            print(f"Model '{MODEL_NAME}' is loaded")
-            sys.exit(0)
-        else:
-            print(f"Model '{MODEL_NAME}' is NOT loaded")
-            sys.exit(1)
-    
+            print(f"Unknown command: {sys.argv[1]}")
+            print("Usage: python lmstudio_manager.py [load|unload|status]")
     else:
-        print(f"Unknown command: {command}")
-        sys.exit(1)
+        print("Usage: python lmstudio_manager.py [load|unload|status]")

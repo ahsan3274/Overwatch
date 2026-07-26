@@ -8,7 +8,8 @@
 # ─────────────────────────────────────────────────────────────────────────────
 
 PROCESSMONITOR="/Applications/ProcessMonitor.app/Contents/MacOS/ProcessMonitor"
-QUEUE="/Users/ahsan/velociraptor-triage/event_queue.jsonl"
+TRIAGE_DIR="${OVERWATCH_HOME:-$HOME/velociraptor-triage}"
+QUEUE="$TRIAGE_DIR/event_queue.jsonl"
 
 if [ ! -f "$PROCESSMONITOR" ]; then
   echo "❌ ProcessMonitor not found at $PROCESSMONITOR"
@@ -22,9 +23,10 @@ echo "   Press Ctrl+C to stop"
 echo ""
 
 "$PROCESSMONITOR" -skipApple -json | python3 -c "
-import sys, json, logging
+import sys, json, logging, os
 
 QUEUE = '$QUEUE'
+USER_HOME = os.path.expanduser('~')
 logging.basicConfig(level=logging.WARNING, format='%(levelname)s: %(message)s')
 log = logging.getLogger(__name__)
 
@@ -87,16 +89,16 @@ TRUSTED_PATHS = [
     '/usr/bin/',
     '/usr/lib/',
     '/System/',
-    '/Library/',
+    '/Library/Application Support/Apple/',
     '/var/folders/',
     '/tmp/',
     '/private/var/',
     '/Applications/Xcode.app/',
     '/Applications/Visual Studio Code.app/',
-    '/Users/ahsan/.nvm/',
-    '/Users/ahsan/.lmstudio/',
-    '/Users/ahsan/.qwen/',
-    '/Users/ahsan/velociraptor-triage/',
+    f'{USER_HOME}/.nvm/',
+    f'{USER_HOME}/.lmstudio/',
+    f'{USER_HOME}/.qwen/',
+    f'{USER_HOME}/velociraptor-triage/',
 ]
 
 # Deduplication cache: {(proc_name, proc_path, event_type): timestamp}

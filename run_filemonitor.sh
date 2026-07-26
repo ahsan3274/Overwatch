@@ -8,7 +8,8 @@
 # ─────────────────────────────────────────────────────────────────────────────
 
 FILEMONITOR="/Applications/FileMonitor.app/Contents/MacOS/FileMonitor"
-QUEUE="/Users/ahsan/velociraptor-triage/event_queue.jsonl"
+TRIAGE_DIR="${OVERWATCH_HOME:-$HOME/velociraptor-triage}"
+QUEUE="$TRIAGE_DIR/event_queue.jsonl"
 
 if [ ! -f "$FILEMONITOR" ]; then
   echo "❌ FileMonitor not found at $FILEMONITOR"
@@ -23,9 +24,10 @@ echo ""
 
 # -skipApple filters out Apple-signed system events to reduce noise
 "$FILEMONITOR" -skipApple -json | python3 -c "
-import sys, json, logging
+import sys, json, logging, os
 
 QUEUE = '$QUEUE'
+USER_HOME = os.path.expanduser('~')
 logging.basicConfig(level=logging.WARNING, format='%(levelname)s: %(message)s')
 log = logging.getLogger(__name__)
 
@@ -92,18 +94,18 @@ TRUSTED_PATHS = [
     '/private/var/folders/',
     '/Applications/Xcode.app/',
     '/Applications/Visual Studio Code.app/',
-    '/Users/ahsan/.nvm/',  # Node version manager (development)
-    '/Users/ahsan/.lmstudio/',
-    '/Users/ahsan/.qwen/',
-    '/Users/ahsan/velociraptor-triage/',
+    f'{USER_HOME}/.nvm/',  # Node version manager (development)
+    f'{USER_HOME}/.lmstudio/',
+    f'{USER_HOME}/.qwen/',
+    f'{USER_HOME}/velociraptor-triage/',
 ]
 
 # Trusted user library paths (reduce noise from common apps)
 TRUSTED_USER_PATHS = [
-    '/Users/ahsan/Library/Caches/',  # App caches
-    '/Users/ahsan/Library/Containers/',  # App sandbox data
-    '/Users/ahsan/Library/Logs/',  # System logs
-    '/Users/ahsan/Library/Saved Application State/',  # App state
+    f'{USER_HOME}/Library/Caches/',  # App caches
+    f'{USER_HOME}/Library/Containers/',  # App sandbox data
+    f'{USER_HOME}/Library/Logs/',  # System logs
+    f'{USER_HOME}/Library/Saved Application State/',  # App state
 ]
 
 # Trusted event types (too noisy)

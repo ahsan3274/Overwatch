@@ -1,36 +1,37 @@
-# Python
-__pycache__/
-*.py[cod]
-*$py.class
-*.so
-.Python
-venv/
-ENV/
-env/
-*.egg-info/
-dist/
-build/
-
-# Triage runtime files (generated at runtime)
+# Runtime evidence and mutable state
+*.log
+*.log.*
 *.lock
 *.jsonl
-*.log
-last_run.json
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
 alert_state.json
+alerter_position.json
+dedup_cache.jsonl
+last_run.json
 osint_context.json
 osint_state.json
-dedup_cache.jsonl
+remediation.log
+stale_events.jsonl
+
+# Local credentials and configuration
+alert_config.yaml
+.env
+.env.*
+!.env.example
+
+# Generated/runtime directories
+__pycache__/
+.pytest_cache/
+archives/
+threat_db/
+venv/
+
+# Local or vendored scanner data
+edr/loki/
+edr/yara-rules/
+edr/yara_rules/
 
 # macOS
 .DS_Store
-.AppleDouble
-.LSOverride
-
-# IDE
-.idea/
-.vscode/
-*.swp
-*.swo
-
-# LM Studio
-.lmstudio/

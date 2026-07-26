@@ -1,0 +1,39 @@
+# Overwatch Alerting Configuration
+# Edit this file to customize alert behavior
+
+# Enable/disable notification channels
+channels:
+  macos_notification: true   # macOS system notifications
+  terminal: true             # Inline terminal alerts
+  slack: false               # Slack webhook alerts
+  discord: false             # Discord webhook alerts
+  email: false               # Email alerts via SMTP
+
+# Slack configuration
+slack:
+  webhook_url: ""            # https://hooks.slack.com/services/XXX
+  channel: "#security-alerts"
+  username: "Overwatch"
+
+# Discord configuration
+discord:
+  webhook_url: ""            # https://discord.com/api/webhooks/XXX
+  username: "Overwatch"
+
+# Email configuration (SMTP)
+email:
+  smtp_server: "smtp.gmail.com"
+  smtp_port: 587
+  username: ""               # Your email address
+  password: ""               # App password (not regular password)
+  from_addr: ""              # Sender address (usually same as username)
+  to_addrs:                  # Recipients
+    - "admin@example.com"
+  use_tls: true
+
+# Alert thresholds
+thresholds:
+  min_risk_score: 7          # Only alert for events >= this score
+  alert_on_levels:           # Which risk levels trigger alerts
+    - "HIGH"
+    - "CRITICAL"

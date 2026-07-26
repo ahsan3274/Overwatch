@@ -24,24 +24,28 @@ for f in event_queue.jsonl scored_events.jsonl processed.jsonl dedup_cache.jsonl
   touch "$TRIAGE_DIR/$f"
 done
 
-# 2. Copy daemon and scripts
+# 2. Copy the core pipeline and its local configuration
 echo "[2/5] Installing scripts..."
-cp triage_daemon.py "$TRIAGE_DIR/triage_daemon.py"
-cp run_filemonitor.sh "$TRIAGE_DIR/run_filemonitor.sh"
-cp run_processmonitor.sh "$TRIAGE_DIR/run_processmonitor.sh"
-chmod +x "$TRIAGE_DIR/triage_daemon.py"
-chmod +x "$TRIAGE_DIR/run_filemonitor.sh"
-chmod +x "$TRIAGE_DIR/run_processmonitor.sh"
+for f in \
+  triage_daemon.py lmstudio_manager.py \
+  false_positive_exceptions.py false_positive_exceptions.json \
+  archive_queue.py alerter_daemon.py network_monitor.py process_watchdog.py \
+  osint_ingester.py run_filemonitor.sh run_processmonitor.sh; do
+  cp "$f" "$TRIAGE_DIR/$f"
+done
+chmod +x \
+  "$TRIAGE_DIR/triage_daemon.py" \
+  "$TRIAGE_DIR/archive_queue.py" \
+  "$TRIAGE_DIR/alerter_daemon.py" \
+  "$TRIAGE_DIR/network_monitor.py" \
+  "$TRIAGE_DIR/process_watchdog.py" \
+  "$TRIAGE_DIR/run_filemonitor.sh" \
+  "$TRIAGE_DIR/run_processmonitor.sh"
 
 # Copy EDR module (optional - provides hash/YARA pre-scoring)
 echo "      Installing EDR module..."
 mkdir -p "$TRIAGE_DIR/edr"
-cp -r overwatch-public/edr/*.py "$TRIAGE_DIR/edr/" 2>/dev/null || {
-    # If overwatch-public/edr doesn't exist, try edr directory in root
-    if [ -d "edr" ]; then
-        cp -r edr/*.py "$TRIAGE_DIR/edr/" 2>/dev/null || true
-    fi
-}
+cp edr/*.py "$TRIAGE_DIR/edr/"
 if [ -d "$TRIAGE_DIR/edr" ] && [ "$(ls -A $TRIAGE_DIR/edr 2>/dev/null)" ]; then
     echo "      EDR module installed"
 else
@@ -74,6 +78,11 @@ python3 -c "import requests" 2>/dev/null && python3 -c "import psutil" 2>/dev/nu
     fi
 }
 echo "   Dependencies: requests, psutil"
+
+# Keep local credentials separate from the tracked example.
+if [ ! -f "$TRIAGE_DIR/alert_config.yaml" ]; then
+  cp alert_config.example.yaml "$TRIAGE_DIR/alert_config.yaml"
+fi
 
 # 5. Patch VQL artifact username
 echo "[5/5] Patching VQL artifact..."

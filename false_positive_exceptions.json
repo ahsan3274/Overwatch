@@ -1,0 +1,42 @@
+{
+  "version": 1,
+  "exceptions": [
+    {
+      "id": "objective-see-lulu-atomic-rules-write",
+      "enabled": true,
+      "source": "filemonitor",
+      "event_types": [
+        "file_create",
+        "file_write"
+      ],
+      "process_name": "com.objective-see.lulu.extension",
+      "process_suffix": "/com.objective-see.lulu.extension.systemextension/Contents/MacOS/com.objective-see.lulu.extension",
+      "path_prefix": "/Library/Objective-See/LuLu/rules.plist.sb-",
+      "signing_status": "signed",
+      "team_id": "VBG97UB4TA",
+      "signing_id": "com.objective-see.lulu.extension",
+      "reason": "Validated LuLu 4.3.1 network extension atomically writing its own temporary firewall-rules file.",
+      "validated_at": "2026-07-27T00:30:00+05:00",
+      "expires_at": "2027-07-27T00:00:00Z"
+    },
+    {
+      "id": "google-updater-atomic-self-write",
+      "enabled": true,
+      "source": "filemonitor",
+      "event_types": [
+        "file_create",
+        "file_write"
+      ],
+      "process_name": "GoogleUpdater",
+      "process_prefix": "{home}/Library/Application Support/Google/GoogleUpdater/",
+      "process_suffix": "/GoogleUpdater.app/Contents/MacOS/GoogleUpdater",
+      "path_prefix": "{home}/Library/Application Support/Google/GoogleUpdater/.com.google.GoogleUpdater.",
+      "signing_status": "signed",
+      "team_id": "EQHXZ8M8AV",
+      "signing_id": "com.google.GoogleUpdater",
+      "reason": "Validated notarized GoogleUpdater atomically writing temporary state inside its own updater directory.",
+      "validated_at": "2026-07-26T01:00:00+05:00",
+      "expires_at": "2027-07-27T00:00:00Z"
+    }
+  ]
+}

@@ -50,7 +50,7 @@ class YaraMatch:
     strings: List[Tuple[str, str, int]]  # (string_name, string_value, offset)
     tags: List[str]
     meta: Dict
-    
+
     def to_dict(self) -> Dict:
         return {
             "rule_name": self.rule_name,
@@ -71,7 +71,7 @@ class ScanResult:
     risk_score: int  # 0-10
     threat_category: str
     scan_time_ms: float
-    
+
     def to_dict(self) -> Dict:
         return {
             "file_path": self.file_path,
@@ -85,7 +85,7 @@ class ScanResult:
 
 class YaraScanner:
     """YARA rule scanner with support for multiple rule sources."""
-    
+
     def __init__(
         self,
         rule_dirs: Optional[List[Path]] = None,
@@ -96,52 +96,52 @@ class YaraScanner:
             raise ImportError(
                 "yara-python not installed. Install with: pip install yara-python"
             )
-        
+
         self.rule_dirs = rule_dirs or DEFAULT_RULE_DIRS
         self.max_file_size = max_file_size_mb * 1024 * 1024
         self.timeout_seconds = timeout_seconds
         self.compiled_rules: Optional[yara.Rules] = None
         self.rule_count = 0
         self._load_rules()
-    
+
     def _load_rules(self):
         """Load and compile YARA rules from all configured directories."""
         rule_files = []
-        
+
         for rule_dir in self.rule_dirs:
             if not rule_dir.exists():
                 log.debug(f"Rule directory not found: {rule_dir}")
                 continue
-            
+
             for root, _, files in os.walk(rule_dir):
                 for file in files:
                     if file.endswith(('.yar', '.yara')):
                         rule_files.append(Path(root) / file)
-        
+
         if not rule_files:
             log.warning("No YARA rules found. Scanner will always return clean.")
             self.compiled_rules = None
             self.rule_count = 0
             return
-        
+
         log.info(f"Loading {len(rule_files)} YARA rule file(s)...")
-        
+
         try:
             # Compile all rules
             self.compiled_rules = yara.compile(
                 filepaths={str(f): str(f) for f in rule_files},
                 includes=True
             )
-            
+
             # Count rules (approximate - YARA doesn't expose exact count)
             self.rule_count = len(rule_files)
             log.info(f"Loaded {self.rule_count} YARA rule file(s) successfully")
-            
+
         except yara.Error as e:
             log.error(f"Failed to compile YARA rules: {e}")
             self.compiled_rules = None
             self.rule_count = 0
-    
+
     def _check_file_size(self, file_path: str) -> bool:
         """Check if file is within size limits."""
         try:
@@ -152,17 +152,17 @@ class YaraScanner:
             return True
         except OSError:
             return False
-    
+
     def scan_file(self, file_path: str) -> ScanResult:
         """
         Scan a single file against all YARA rules.
-        
+
         Returns:
             ScanResult with matches and risk assessment.
         """
         import time
         start_time = time.time()
-        
+
         # Check file size
         if not self._check_file_size(file_path):
             return ScanResult(
@@ -173,7 +173,7 @@ class YaraScanner:
                 threat_category="skipped_size",
                 scan_time_ms=(time.time() - start_time) * 1000
             )
-        
+
         # Scan
         matches = []
         try:
@@ -182,7 +182,7 @@ class YaraScanner:
                     file_path,
                     timeout=self.timeout_seconds
                 )
-                
+
                 for match in yara_matches:
                     yara_match = YaraMatch(
                         rule_name=match.rule,
@@ -193,7 +193,7 @@ class YaraScanner:
                         meta=match.meta
                     )
                     matches.append(yara_match)
-        
+
         except yara.TimeoutError:
             log.warning(f"YARA scan timeout for {file_path}")
             return ScanResult(
@@ -214,11 +214,11 @@ class YaraScanner:
                 threat_category="error",
                 scan_time_ms=(time.time() - start_time) * 1000
             )
-        
+
         # Calculate risk score
         risk_score = self._calculate_risk_score(matches)
         threat_category = self._determine_threat_category(matches)
-        
+
         return ScanResult(
             file_path=file_path,
             matches=matches,
@@ -227,15 +227,15 @@ class YaraScanner:
             threat_category=threat_category,
             scan_time_ms=(time.time() - start_time) * 1000
         )
-    
+
     def scan_files(self, file_paths: List[str]) -> List[ScanResult]:
         """Scan multiple files."""
         return [self.scan_file(path) for path in file_paths]
-    
+
     def _calculate_risk_score(self, matches: List[YaraMatch]) -> int:
         """
         Calculate risk score (0-10) based on YARA matches.
-        
+
         Scoring:
         - Malware family match: +8
         - Suspicious/behavioral match: +5
@@ -243,45 +243,45 @@ class YaraScanner:
         - Generic suspicious strings: +2
         """
         score = 0
-        
+
         for match in matches:
             rule_name = match.rule_name.lower()
             tags = [t.lower() for t in match.tags]
-            
+
             # High confidence malware
             if any(kw in rule_name for kw in ['malware', 'trojan', 'rat', 'backdoor', 'stealer']):
                 score += 8
             elif any(kw in tags for kw in ['malware', 'trojan', 'rat']):
                 score += 8
-            
+
             # Suspicious behavior
             elif any(kw in rule_name for kw in ['suspicious', 'payload', 'shellcode']):
                 score += 5
             elif any(kw in tags for kw in ['suspicious', 'payload']):
                 score += 5
-            
+
             # Packers/crypters (often legitimate but suspicious)
             elif any(kw in rule_name for kw in ['packer', 'crypter', 'obfuscated']):
                 score += 4
             elif any(kw in tags for kw in ['packer', 'crypter']):
                 score += 4
-            
+
             # Generic indicators
             else:
                 score += 2
-        
+
         return min(10, score)
-    
+
     def _determine_threat_category(self, matches: List[YaraMatch]) -> str:
         """Determine primary threat category from matches."""
         if not matches:
             return "clean"
-        
+
         categories = set()
         for match in matches:
             rule_name = match.rule_name.lower()
             tags = [t.lower() for t in match.tags]
-            
+
             if any(kw in rule_name for kw in ['malware', 'trojan', 'rat', 'backdoor']):
                 categories.add('malware')
             elif any(kw in rule_name for kw in ['packer', 'crypter']):
@@ -290,7 +290,7 @@ class YaraScanner:
                 categories.add('suspicious')
             elif any(kw in tags for kw in ['malware', 'trojan']):
                 categories.add('malware')
-        
+
         if 'malware' in categories:
             return 'malware'
         elif 'packer' in categories:
@@ -299,12 +299,12 @@ class YaraScanner:
             return 'suspicious'
         else:
             return 'yara_match'
-    
+
     def reload_rules(self):
         """Reload YARA rules (useful after updating rule files)."""
         log.info("Reloading YARA rules...")
         self._load_rules()
-    
+
     def get_stats(self) -> Dict:
         """Get scanner statistics."""
         return {
@@ -318,7 +318,7 @@ def setup_rule_directories():
     """Create default YARA rule directories with setup instructions."""
     for rule_dir in DEFAULT_RULE_DIRS:
         rule_dir.mkdir(parents=True, exist_ok=True)
-        
+
         # Create README with setup instructions
         readme_path = rule_dir / "README.md"
         if not readme_path.exists():
@@ -355,10 +355,10 @@ rule Example_Malware {
         description = "Example malware detection"
         author = "Your Name"
         date = "2026-01-01"
-    
+
     strings:
         $a = "malicious_string"
-    
+
     condition:
         $a
 }
@@ -373,19 +373,19 @@ def test_scanner():
         print("❌ yara-python not installed")
         print("   Install with: pip install yara-python")
         return
-    
+
     # Setup directories
     setup_rule_directories()
-    
+
     # Create scanner
     scanner = YaraScanner()
     stats = scanner.get_stats()
-    
+
     print(f"YARA Scanner Status:")
     print(f"  Available: {stats['yara_available']}")
     print(f"  Rules Loaded: {stats['rules_loaded']} files")
     print(f"  Rule Directories: {stats['rule_directories']}")
-    
+
     if stats['rules_loaded'] == 0:
         print("\n⚠️  No YARA rules found. Install rules from:")
         for name, url in RULE_SOURCES.items():

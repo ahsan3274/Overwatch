@@ -18,6 +18,13 @@ import subprocess
 import requests
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Optional
+from lmstudio_manager import get_manager
+from false_positive_exceptions import (
+    append_audit as append_false_positive_audit,
+    exception_score,
+    match_event as match_false_positive_exception,
+)
 
 # Try to import psutil for better system monitoring (optional)
 try:
@@ -52,10 +59,9 @@ except ImportError:
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-LM_STUDIO_URL  = "http://localhost:1234/v1/chat/completions"
-MODEL_NAME     = "redsage-qwen3-8b-dpo"   # match exactly what LM Studio shows
 
-BASE_DIR       = Path.home() / "velociraptor-triage"
+USER_HOME      = str(Path.home())
+BASE_DIR       = Path(USER_HOME) / "velociraptor-triage"
 EVENT_QUEUE    = BASE_DIR / "event_queue.jsonl"
 SCORED_LOG     = BASE_DIR / "scored_events.jsonl"
 PROCESSED_LOG  = BASE_DIR / "processed.jsonl"
@@ -63,28 +69,30 @@ DEDUP_CACHE    = BASE_DIR / "dedup_cache.jsonl"
 LOCK_FILE      = BASE_DIR / "triage.lock"
 LOG_FILE       = BASE_DIR / "triage_daemon.log"
 LAST_RUN_FILE  = BASE_DIR / "last_run.json"  # Track last successful run time
+STALE_LOG      = BASE_DIR / "stale_events.jsonl"
 
 MAX_EVENTS_PER_RUN  = 200     # Increased for high-volume processing
 REQUEST_TIMEOUT_SEC = 60      # Reduced timeout for faster failures
 RISK_THRESHOLD      = 7       # >= this score triggers HIGH flag
 DEDUP_WINDOW_SEC    = 300     # ignore duplicate events within 5 minutes
+LIVE_EVENT_LOOKBACK_HOURS = 24  # recency heuristic for live model triage
+MAX_EVENT_AGE_SEC = LIVE_EVENT_LOOKBACK_HOURS * 60 * 60
 
 # ── Exclusions (False Positive Reduction) ─────────────────────────────────────
 
 # Skip events from these paths (trusted locations)
 EXCLUDED_PATHS = [
-    "/Users/ahsan/.lmstudio/",
-    "/Users/ahsan/.qwen/",
-    "/Users/ahsan/Library/Application Support/Notesnook/",  # Verified signed app
-    "/Users/ahsan/Library/Application Support/LM Studio/",  # LM Studio cache files
-    "/Users/ahsan/Library/Application Support/Mullvad VPN/",  # Mullvad VPN cache
-    "/Users/ahsan/Library/Application Support/BraveSoftware/",  # Brave Browser data
-    "/Users/ahsan/Library/Caches/",  # User cache directory
-    "/Users/ahsan/Library/Containers/",  # App sandbox containers
-    "/Users/ahsan/Library/Logs/",  # System logs
-    "/Users/ahsan/Library/Saved Application State/",  # App state
-    "/Users/ahsan/velociraptor-triage/",  # Our own triage directory
-    "/Users/root/velociraptor-triage/",  # Our own triage directory (root)
+    f"{USER_HOME}/.lmstudio/",
+    f"{USER_HOME}/.qwen/",
+    f"{USER_HOME}/Library/Application Support/Notesnook/",  # Verified signed app
+    f"{USER_HOME}/Library/Application Support/LM Studio/",  # LM Studio cache files
+    f"{USER_HOME}/Library/Application Support/Mullvad VPN/",  # Mullvad VPN cache
+    f"{USER_HOME}/Library/Application Support/BraveSoftware/",  # Brave Browser data
+    f"{USER_HOME}/Library/Caches/",  # User cache directory
+    f"{USER_HOME}/Library/Containers/",  # App sandbox containers
+    f"{USER_HOME}/Library/Logs/",  # System logs
+    f"{USER_HOME}/Library/Saved Application State/",  # App state
+    f"{USER_HOME}/velociraptor-triage/",  # Our own triage directory
     "/Applications/Xcode.app/",
     "/Applications/Visual Studio Code.app/",
     "/Applications/FileMonitor.app/",
@@ -100,9 +108,7 @@ EXCLUDED_PATHS = [
     "/usr/lib/",
     "/System/",
     "/private/var/folders/",  # macOS temp folders
-    "/tmp/",  # Temp files (malware often lands here - monitor but don't alert)
     "/dev/",  # Device files
-    "/",  # Root path (too broad)
 ]
 
 # Skip these event types (too noisy, low security value)
@@ -124,7 +130,6 @@ EXCLUDED_PROCESSES = [
 # ── LM Studio CLI ─────────────────────────────────────────────────────────────
 
 LM_STUDIO_CLI = "lms"  # LM Studio CLI command
-LM_STUDIO_MODEL = MODEL_NAME
 LM_STUDIO_STARTUP_TIMEOUT = 30  # Max seconds to wait for LM Studio to start
 
 # ── Intelligent Scheduling ────────────────────────────────────────────────────
@@ -153,6 +158,49 @@ EDR_YARA_SCAN = True           # Enable YARA rule scanning
 EDR_RISK_BOOST = 3             # Risk score boost for EDR matches (added to LLM score)
 EDR_AUTO_FLAG_THRESHOLD = 8    # Auto-flag as HIGH if EDR risk >= this (skip LLM)
 
+# Only scan destinations whose contents can plausibly execute or establish
+# persistence. FileMonitor's signing status describes the writer, not the
+# destination, so routine browser databases must not be sent to hash reputation.
+EDR_RISKY_EXTENSIONS = {
+    ".app", ".bin", ".bundle", ".command", ".dylib", ".exe", ".jar",
+    ".js", ".kext", ".mach-o", ".pkg", ".plugin", ".py", ".scpt",
+    ".sh", ".so", ".swift", ".workflow",
+}
+EDR_RISKY_PATH_PREFIXES = (
+    "/Library/LaunchAgents/",
+    "/Library/LaunchDaemons/",
+    "/Library/PrivilegedHelperTools/",
+    "/private/tmp/",
+    "/tmp/",
+    str(Path.home() / "Downloads") + "/",
+    str(Path.home() / "Library/LaunchAgents") + "/",
+)
+
+CHROME_BINARY = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+ROUTINE_FILE_EVENTS = {"file_create", "file_write", "file_unlink", "file_rename"}
+TRUSTED_MAINTENANCE_WRITERS = (
+    (
+        CHROME_BINARY,
+        str(Path.home() / "Library/Application Support/Google/Chrome") + "/",
+        "signed_chrome_application_support",
+    ),
+    (
+        "/Applications/OpenVPN Connect/OpenVPN Connect.app/Contents/MacOS/OpenVPN Connect",
+        str(Path.home() / "Library/Application Support/OpenVPN Connect") + "/",
+        "signed_openvpn_connect_application_support",
+    ),
+    (
+        "/Applications/LibreOffice.app/Contents/MacOS/soffice",
+        str(Path.home() / "Library/Application Support/LibreOffice/4/user") + "/",
+        "signed_libreoffice_user_configuration",
+    ),
+    (
+        "/Applications/GitHub Desktop.app/Contents/Frameworks/GitHub Desktop Helper.app/Contents/MacOS/GitHub Desktop Helper",
+        str(Path.home() / "Library/Application Support/GitHub Desktop") + "/",
+        "signed_github_desktop_application_support",
+    ),
+)
+
 # ── Logging ───────────────────────────────────────────────────────────────────
 # Note: Logging is configured in configure_logging() after directory exists
 # logging.basicConfig() only works on first call, so we configure it once in main()
@@ -164,19 +212,19 @@ def configure_logging():
     """Configure logging handlers. Call once after BASE_DIR exists."""
     # Ensure directory exists
     BASE_DIR.mkdir(parents=True, exist_ok=True)
-    
+
     # Clear any existing handlers
     log.handlers.clear()
     log.setLevel(logging.INFO)
-    
+
     # Create formatter
     formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
-    
+
     # File handler
     file_handler = logging.FileHandler(LOG_FILE)
     file_handler.setFormatter(formatter)
     log.addHandler(file_handler)
-    
+
     # Console handler
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setFormatter(formatter)
@@ -203,7 +251,7 @@ def get_cpu_usage() -> float:
                         user = float(parts[0].split("%")[0].split(":")[1].strip())
                         sys_cpu = float(parts[1].split("%")[0].split(":")[1].strip())
                         return user + sys_cpu
-        except (subprocess.SubprocessError, ValueError, IndexError):
+        except (subprocess.SubprocessError, OSError, ValueError, IndexError):
             pass
         return 50.0  # Default assumption
 
@@ -230,17 +278,17 @@ def get_memory_usage() -> dict:
                 if ":" in line:
                     key, val = line.split(":")
                     pages[key.strip()] = int(val.strip().rstrip("."))
-            
+
             total = pages.get("Pages active", 0) + pages.get("Pages inactive", 0) + \
                     pages.get("Pages speculative", 0) + pages.get("Pages wired down", 0)
             available = pages.get("Pages inactive", 0) + pages.get("Pages free", 0)
-            
+
             return {
                 "total_gb": (total * page_size) / (1024**3),
                 "available_gb": (available * page_size) / (1024**3),
                 "used_percent": 100 - (available / max(total, 1) * 100),
             }
-        except (subprocess.SubprocessError, ValueError, KeyError):
+        except (subprocess.SubprocessError, OSError, ValueError, KeyError):
             return {"total_gb": 16, "available_gb": 8, "used_percent": 50}
 
 
@@ -257,9 +305,9 @@ def get_user_idle_time() -> float:
                 # Parse "HIDIdleTime" = 123456789000 (nanoseconds)
                 idle_ns = int(line.split("=")[1].strip())
                 return idle_ns / 1e9  # Convert to seconds
-    except (subprocess.SubprocessError, ValueError, IndexError):
+    except (subprocess.SubprocessError, OSError, ValueError, IndexError):
         pass
-    
+
     # Fallback: assume active if we can't determine
     return 0
 
@@ -272,7 +320,7 @@ def get_foreground_app() -> str:
             capture_output=True, text=True, timeout=3
         )
         return result.stdout.strip()
-    except (subprocess.SubprocessError, FileNotFoundError):
+    except (subprocess.SubprocessError, OSError):
         return "unknown"
 
 
@@ -335,7 +383,7 @@ def should_process_events(last_run_time: float = None) -> tuple[bool, str]:
     """
     Determine if we should process events now or defer.
     Returns (should_process, reason).
-    
+
     Check order:
     1. Max defer time (forces processing regardless of load)
     2. Critical resources (RAM)
@@ -385,28 +433,28 @@ def calculate_dynamic_batch_size(load: dict = None) -> int:
     """
     if load is None:
         load = calculate_system_load()
-    
+
     # Start with base batch size
     batch = BATCH_BASE
-    
+
     # Reduce for high CPU
     if load["cpu_percent"] > 30:
         batch *= 0.7
     if load["cpu_percent"] > 50:
         batch *= 0.5
-    
+
     # Reduce for low RAM
     if load["mem_available_gb"] < 8:
         batch *= 0.7
     if load["mem_available_gb"] < 6:
         batch *= 0.5
-    
+
     # Increase for very idle system
     if load["idle_time_sec"] > 600:
         batch *= 1.2
     if load["idle_time_sec"] > 1800:
         batch *= 1.5
-    
+
     # Clamp to min/max
     return max(BATCH_MIN, min(int(batch), BATCH_MAX))
 
@@ -434,7 +482,7 @@ def get_osint_context() -> str:
     """Get OSINT threat context if available."""
     if not HAS_OSINT or osint_ingester is None:
         return ""
-    
+
     try:
         prompt = osint_ingester.get_osint_prompt_for_triage()
         return prompt
@@ -446,7 +494,7 @@ def get_osint_context() -> str:
 def build_prompt(event: dict) -> str:
     # Get OSINT context
     osint_context = get_osint_context()
-    
+
     base_prompt = f"""Analyze this macOS security event:
 
 Source: {event.get('source', 'unknown')}
@@ -459,11 +507,11 @@ Timestamp: {event.get('timestamp', 'unknown')}
 Raw: {json.dumps(event.get('raw', {}), indent=2)}
 
 Return only the JSON risk assessment."""
-    
+
     # Prepend OSINT context if available
     if osint_context:
         return osint_context + base_prompt
-    
+
     return base_prompt
 
 # ── Deduplication ─────────────────────────────────────────────────────────────
@@ -472,6 +520,60 @@ def event_fingerprint(event: dict) -> str:
     """Hash event_type + path + process to detect duplicates."""
     key = f"{event.get('event_type','')}{event.get('path','')}{event.get('process','')}"
     return hashlib.md5(key.encode()).hexdigest()
+
+
+def parse_event_timestamp(value: object) -> datetime | None:
+    """Parse collector timestamps and normalize them to UTC.
+
+    Objective-See FileMonitor emits ``YYYY-MM-DD HH:MM:SS +0000``, which
+    Python 3.9's ``datetime.fromisoformat`` does not accept. Try ISO first,
+    then the explicit FileMonitor format.
+    """
+    if not isinstance(value, str) or not value or value == "Unknown":
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        try:
+            parsed = datetime.strptime(value, "%Y-%m-%d %H:%M:%S %z")
+        except ValueError:
+            return None
+
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=datetime.now().astimezone().tzinfo)
+    return parsed.astimezone(timezone.utc)
+
+
+def partition_stale_events(
+    events: list[dict],
+    now: datetime | None = None,
+) -> tuple[list[dict], list[dict]]:
+    """Separate recent live events from archive-only evidence.
+
+    The 24-hour boundary is a triage heuristic, not a deletion policy. Older
+    or unparseable events are preserved in the stale archive but are not sent
+    to the live model.
+    """
+    reference = now or datetime.now(timezone.utc)
+    if reference.tzinfo is None:
+        reference = reference.replace(tzinfo=timezone.utc)
+    cutoff = reference.astimezone(timezone.utc).timestamp() - MAX_EVENT_AGE_SEC
+    live, stale = [], []
+    for event in events:
+        timestamp = parse_event_timestamp(event.get("timestamp"))
+        if timestamp is None or timestamp.timestamp() < cutoff:
+            stale.append(event)
+        else:
+            live.append(event)
+    return live, stale
+
+
+def archive_stale_events(events: list[dict]):
+    if not events:
+        return
+    with open(STALE_LOG, "a") as stream:
+        for event in events:
+            stream.write(json.dumps(event) + "\n")
 
 def load_dedup_cache() -> dict:
     """Load recent fingerprints and their timestamps."""
@@ -503,12 +605,14 @@ def deduplicate(events: list[dict]) -> tuple[list[dict], int]:
     Note: Does NOT modify the cache - caller must add fingerprints after successful scoring.
     """
     cache = load_dedup_cache()
+    seen = set(cache)
     unique, skipped = [], 0
     for event in events:
         fp = event_fingerprint(event)
-        if fp in cache:
+        if fp in seen:
             skipped += 1
             continue
+        seen.add(fp)
         unique.append(event)
     return unique, skipped
 
@@ -516,38 +620,44 @@ def deduplicate(events: list[dict]) -> tuple[list[dict], int]:
 def is_excluded(event: dict) -> bool:
     """
     Check if event should be excluded (false positive reduction).
-    
+
     Checks:
     1. Path in EXCLUDED_PATHS
     2. Event type in EXCLUDED_EVENT_TYPES
     3. Process in EXCLUDED_PROCESSES
-    
+
     Returns True if event should be excluded.
     """
     path = event.get("path", "")
     event_type = event.get("event_type", "")
     process = event.get("process", "")
-    
+
+    # Watchdog audit/enforcement records describe an explicit local policy.
+    # They are operational telemetry, not intrusion evidence, and must never
+    # reach the LLM.
+    if event.get("source") == "process_watchdog":
+        return True
+
     # Check excluded paths
     for excluded in EXCLUDED_PATHS:
         if path.startswith(excluded):
             return True
-    
+
     # Check excluded event types
     if event_type in EXCLUDED_EVENT_TYPES:
         return True
-    
+
     # Check excluded processes
     for excluded in EXCLUDED_PROCESSES:
         if process.startswith(excluded):
             return True
-    
+
     return False
 
 
 def add_to_dedup_cache(event: dict):
     """Add an event's fingerprint to the dedup cache after successful scoring.
-    
+
     Note: For better performance, use add_multiple_to_dedup_cache() for batch operations.
     """
     cache = load_dedup_cache()
@@ -575,7 +685,7 @@ def normalize_filemonitor(raw: dict) -> dict:
 
     Idempotent: safe to run multiple times on already-normalized events.
     Handles both old format (event.process) and new format (file.process).
-    
+
     Returns None for events that should be excluded (CLOSE, OPEN - too noisy).
     """
     # Check if already normalized
@@ -605,7 +715,7 @@ def normalize_filemonitor(raw: dict) -> dict:
 
     return {
         "source":         "filemonitor",
-        "timestamp":      get_utc_timestamp(),
+        "timestamp":      raw.get("timestamp", get_utc_timestamp()),
         "event_type":     f"file_{event_type_str.split('_')[-1]}",
         "path":           destination,
         "process":        process_info.get("path", {}).get("name", "unknown") if isinstance(process_info.get("path"), dict) else str(process_info.get("path", "unknown")),
@@ -616,13 +726,13 @@ def normalize_filemonitor(raw: dict) -> dict:
 
 def normalize_processmonitor(raw: dict) -> dict:
     """Normalize Objective-See ProcessMonitor JSON output.
-    
+
     Idempotent: safe to run multiple times on already-normalized events.
     """
     # Check if already normalized
     if raw.get("source") == "processmonitor" and "raw" in raw:
         return raw
-    
+
     process = raw.get("process", {})
     return {
         "source":         "processmonitor",
@@ -637,7 +747,7 @@ def normalize_processmonitor(raw: dict) -> dict:
 
 def normalize_velociraptor(raw: dict) -> dict:
     """Velociraptor events are already in our schema — pass through.
-    
+
     Idempotent: safe to run multiple times on already-normalized events.
     """
     # Check if already normalized
@@ -685,7 +795,7 @@ def get_loaded_models() -> list[dict]:
         )
         if result.returncode != 0:
             return []
-        
+
         data = json.loads(result.stdout)
         if isinstance(data, list):
             return data
@@ -693,7 +803,7 @@ def get_loaded_models() -> list[dict]:
             return data["models"]
     except (subprocess.SubprocessError, json.JSONDecodeError, FileNotFoundError):
         pass
-    
+
     return []
 
 
@@ -702,17 +812,17 @@ def is_model_loaded() -> bool:
     loaded = get_loaded_models()
     if not loaded:
         return False
-    
+
     # Check if our model is loaded (by identifier or path)
     for model in loaded:
         identifier = model.get("identifier", "") or model.get("id", "")
         path = model.get("path", "")
-        
+
         if LM_STUDIO_MODEL in identifier or MODEL_NAME in identifier or \
            LM_STUDIO_MODEL in path or MODEL_NAME in path:
             log.info(f"Model '{LM_STUDIO_MODEL}' already loaded")
             return True
-    
+
     log.warning(f"LM Studio running but model '{LM_STUDIO_MODEL}' not loaded")
     log.warning(f"Loaded models: {[m.get('identifier', m.get('id', '?')) for m in loaded]}")
     return False
@@ -724,9 +834,9 @@ def unload_all_models() -> bool:
     if not loaded:
         log.debug("No models to unload")
         return True
-    
+
     log.info(f"Unloading {len(loaded)} model(s)...")
-    
+
     # Use --all flag to unload everything at once
     try:
         result = subprocess.run(
@@ -743,7 +853,7 @@ def unload_all_models() -> bool:
             log.warning(f"Batch unload failed: {result.stderr}")
     except Exception as e:
         log.warning(f"Failed to unload models: {e}")
-    
+
     return False
 
 
@@ -774,7 +884,7 @@ def start_lm_studio_server() -> bool:
         if result.returncode != 0:
             log.error(f"Failed to start server: {result.stderr}")
             return False
-        
+
         # Wait for server to be ready
         log.info("Waiting for server to be ready...")
         for _ in range(30):
@@ -782,7 +892,7 @@ def start_lm_studio_server() -> bool:
             if is_lm_studio_running():
                 log.info("Server is ready")
                 return True
-        
+
         log.error("Server did not become ready in time")
         return False
     except (subprocess.SubprocessError, FileNotFoundError) as e:
@@ -794,16 +904,16 @@ def load_lm_studio_model() -> bool:
     """
     Load the RedSage model into LM Studio.
     Unloads any existing models first to avoid conflicts.
-    
+
     Note: 'lms load' is a long-running command that stays active while the model
     is loaded. We run it in background and poll for the model to appear.
     """
     # First unload any existing models
     unload_all_models()
-    
+
     try:
         log.info(f"Loading model '{LM_STUDIO_MODEL}'...")
-        
+
         # Load with appropriate options for triage use
         # --ttl: Auto-unload after 5 min of inactivity (saves resources)
         # --context-length: Reasonable context window for security events
@@ -818,20 +928,20 @@ def load_lm_studio_model() -> bool:
             stderr=subprocess.DEVNULL,
             start_new_session=True
         )
-        
+
         # Wait for model to fully load
         log.info(f"Waiting for model to load (timeout: {LM_STUDIO_STARTUP_TIMEOUT}s)...")
         start = time.time()
-        
+
         while time.time() - start < LM_STUDIO_STARTUP_TIMEOUT:
             if is_model_loaded():
                 log.info(f"Model '{LM_STUDIO_MODEL}' loaded successfully")
                 return True
             time.sleep(1)
-        
+
         log.error(f"Model '{LM_STUDIO_MODEL}' did not load within {LM_STUDIO_STARTUP_TIMEOUT}s")
         return False
-        
+
     except Exception as e:
         log.error(f"Failed to load model: {e}")
         return False
@@ -874,7 +984,7 @@ def stop_lm_studio_server() -> bool:
 def ensure_lm_studio_ready(max_retries: int = 2) -> bool:
     """
     Ensure LM Studio server is running and model is loaded.
-    
+
     Uses lmstudio_manager module if available, otherwise falls back to
     inline implementation.
 
@@ -883,10 +993,10 @@ def ensure_lm_studio_ready(max_retries: int = 2) -> bool:
     # Prefer using lmstudio_manager if available
     if HAS_LMSTUDIO_MANAGER:
         log.info("Using lmstudio_manager module")
-        if lmstudio_manager.ensure_model_loaded(MODEL_NAME, retry=True):
+        if get_manager().ensure_loaded():
             return True
         log.warning("lmstudio_manager failed, falling back to inline implementation")
-    
+
     # Fallback to inline implementation
     for attempt in range(1, max_retries + 1):
         log.info(f"LM Studio check (attempt {attempt}/{max_retries})...")
@@ -929,6 +1039,105 @@ def ensure_lm_studio_ready(max_retries: int = 2) -> bool:
 
 # ── EDR Pre-Scoring ───────────────────────────────────────────────────────────
 
+_edr_engine = None
+
+
+def deterministic_maintenance_score(event: dict) -> Optional[dict]:
+    """Return a conservative deterministic score for an exact trusted pattern.
+
+    This intentionally matches both the signed writer and its narrow data
+    directory. Lookalike paths, unsigned writers, executable destinations, and
+    all other telemetry continue through EDR/LLM analysis.
+    """
+    try:
+        exception = match_false_positive_exception(event)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        log.error(
+            "False-positive exception registry invalid; failing closed: %s",
+            exc,
+        )
+        exception = None
+    if exception:
+        return exception_score(exception)
+
+    path = str(event.get("path", ""))
+    process = str(event.get("process", ""))
+    common_match = (
+        event.get("source") == "filemonitor"
+        and event.get("event_type") in ROUTINE_FILE_EVENTS
+        and event.get("signing_status") == "signed"
+        and Path(path).suffix.lower() not in EDR_RISKY_EXTENSIONS
+        and not any(path.startswith(prefix) for prefix in EDR_RISKY_PATH_PREFIXES)
+    )
+    matched_rule = next(
+        (
+            rule
+            for writer, prefix, rule in TRUSTED_MAINTENANCE_WRITERS
+            if common_match and process == writer and path.startswith(prefix)
+        ),
+        None,
+    )
+    if matched_rule:
+        return {
+            "risk_score": 1,
+            "risk_level": "LOW",
+            "category": "trusted_maintenance",
+            "explanation": (
+                "A signed allowlisted application maintained non-executable "
+                "data inside its exact application-support directory."
+            ),
+            "recommended_action": "No action; retain telemetry for audit.",
+            "confidence": 1.0,
+            "deterministic_fast_path": True,
+            "rule": matched_rule,
+        }
+    return None
+
+
+def partition_deterministic_events(
+    events: list[dict],
+) -> tuple[list[tuple[dict, dict]], list[dict]]:
+    """Split exact trusted-maintenance matches from events needing analysis."""
+    deterministic = []
+    analysis = []
+    for event in events:
+        score = deterministic_maintenance_score(event)
+        if score:
+            deterministic.append((event, score))
+        else:
+            analysis.append(event)
+    return deterministic, analysis
+
+
+def should_scan_file_with_edr(event: dict) -> bool:
+    """Limit content scanning to executable or persistence-relevant writes."""
+    if event.get("source") != "filemonitor":
+        return False
+    if event.get("event_type") not in {"file_create", "file_write", "file_rename"}:
+        return False
+
+    file_path = str(event.get("path", ""))
+    if not file_path or not os.path.isfile(file_path):
+        return False
+
+    lowered = file_path.lower()
+    risky_extension = Path(lowered).suffix in EDR_RISKY_EXTENSIONS
+    risky_location = any(file_path.startswith(prefix) for prefix in EDR_RISKY_PATH_PREFIXES)
+    executable = os.access(file_path, os.X_OK)
+    return risky_extension or risky_location or executable
+
+
+def get_edr_engine():
+    """Reuse expensive YARA compilation, HTTP session, and reputation state."""
+    global _edr_engine
+    if _edr_engine is None:
+        _edr_engine = edr_ingester.EDREngine(
+            enable_hash_lookup=EDR_HASH_LOOKUP,
+            enable_yara=EDR_YARA_SCAN,
+        )
+    return _edr_engine
+
+
 def edr_pre_score(event: dict) -> tuple[Optional[dict], Optional[dict]]:
     """
     Run EDR pre-scoring on an event before LLM analysis.
@@ -947,20 +1156,13 @@ def edr_pre_score(event: dict) -> tuple[Optional[dict], Optional[dict]]:
     if not EDR_ENABLED or not edr_ingester:
         return None, None
 
-    # Extract file path from event
-    file_path = event.get("path")
-    if not file_path or not os.path.isfile(file_path):
+    if not should_scan_file_with_edr(event):
         return None, None
+    file_path = event["path"]
 
     try:
-        # Initialize EDR engine for this scan
-        engine = edr_ingester.EDREngine(
-            enable_hash_lookup=EDR_HASH_LOOKUP,
-            enable_yara=EDR_YARA_SCAN
-        )
-
         # Scan the file
-        edr_result = engine.scan_file(file_path)
+        edr_result = get_edr_engine().scan_file(file_path)
 
         if not edr_result or not edr_result.edr_detected:
             return None, None
@@ -1034,67 +1236,49 @@ def apply_edr_risk_boost(llm_assessment: dict, edr_result: dict) -> dict:
 
 
 def score_event(event: dict) -> dict | None:
-    payload = {
-        "model": MODEL_NAME,
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user",   "content": build_prompt(event)},
-        ],
-        "temperature": 0.1,
-        "max_tokens":  256,
+    """Score an event while keeping RedSage loaded for the current batch."""
+    manager = get_manager()
+
+    result = manager.score_threat(event, unload_after=False)
+
+    if result is None:
+        return None
+
+    # Convert manager result to triage daemon format
+    risk_score = result.get('risk_score', 0)
+
+    # Map to risk level
+    if risk_score >= 9:
+        risk_level = "CRITICAL"
+    elif risk_score >= 7:
+        risk_level = "HIGH"
+    elif risk_score >= 4:
+        risk_level = "MEDIUM"
+    else:
+        risk_level = "LOW"
+
+    # Map threat type to category
+    threat_type = result.get('threat_type', 'unknown')
+    category_map = {
+        'malware': 'malware',
+        'backdoor': 'backdoor',
+        'c2': 'c2_communication',
+        'miner': 'cryptominer',
+        'suspicious': 'suspicious_activity',
+        'benign': 'benign'
     }
-    try:
-        r = requests.post(LM_STUDIO_URL, json=payload, timeout=REQUEST_TIMEOUT_SEC)
-        r.raise_for_status()
-        text = r.json()["choices"][0]["message"]["content"].strip()
+    category = category_map.get(threat_type, 'unknown')
 
-        # Extract JSON from markdown code blocks if present
-        if "```" in text:
-            # Try to find JSON between ```json and ``` or just ``` and ```
-            json_match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', text, re.DOTALL)
-            if json_match:
-                text = json_match.group(1)
-            else:
-                # Fallback: extract content between first ``` and last ```
-                parts = text.split("```")
-                if len(parts) >= 2:
-                    text = parts[1].strip()
-                    if text.startswith("json"):
-                        text = text[4:].strip()
+    return {
+        "risk_score": risk_score,
+        "risk_level": risk_level,
+        "category": category,
+        "explanation": result.get('reasoning', 'No explanation provided'),
+        "recommended_action": f"Investigate {threat_type} activity",
+        "confidence": result.get('confidence', 0.5),
+        "raw": result  # Keep full LLM response
+    }
 
-        result = json.loads(text)
-        
-        # Validate required fields in response
-        required_fields = ["risk_score", "risk_level", "category", "explanation", "recommended_action"]
-        for field in required_fields:
-            if field not in result:
-                log.warning(f"LM Studio response missing required field: {field}")
-                return None
-        
-        # Validate risk_score is an integer 1-10
-        risk_score = result.get("risk_score")
-        if not isinstance(risk_score, int) or risk_score < 1 or risk_score > 10:
-            log.warning(f"Invalid risk_score: {risk_score} (expected int 1-10)")
-            return None
-        
-        # Validate risk_level is one of the expected values
-        valid_levels = ["LOW", "MEDIUM", "HIGH", "CRITICAL"]
-        if result.get("risk_level") not in valid_levels:
-            log.warning(f"Invalid risk_level: {result.get('risk_level')} (expected {valid_levels})")
-            return None
-        
-        return result
-    except requests.exceptions.ConnectionError:
-        log.error("LM Studio not reachable at localhost:1234")
-        return None
-    except (KeyError, json.JSONDecodeError) as e:
-        log.warning(f"Failed to parse LM Studio response: {e}")
-        return None
-    except requests.exceptions.Timeout:
-        log.warning(f"LM Studio timed out after {REQUEST_TIMEOUT_SEC}s")
-        return None
-
-# ── Queue I/O ─────────────────────────────────────────────────────────────────
 
 def read_queue() -> list[dict]:
     if not EVENT_QUEUE.exists():
@@ -1127,6 +1311,12 @@ def write_scored(event: dict, score: dict):
     }
     with open(SCORED_LOG, "a") as f:
         f.write(json.dumps(result) + "\n")
+
+    if score.get("false_positive_exception"):
+        try:
+            append_false_positive_audit(event, score)
+        except OSError as exc:
+            log.warning(f"Failed to append false-positive audit record: {exc}")
 
     risk = score.get("risk_score", 0)
     level = score.get("risk_level", "?")
@@ -1206,10 +1396,10 @@ def main():
     try:
         # Get last run time for defer tracking
         last_run_time = get_last_run_time()
-        
+
         # Check system load and decide whether to process or defer
         should_process, reason = should_process_events(last_run_time)
-        
+
         if not should_process:
             log.info(f"Deferring processing: {reason}")
             log.info("Events will remain in queue for next run.")
@@ -1217,15 +1407,20 @@ def main():
             if EVENT_QUEUE.exists() and EVENT_QUEUE.stat().st_size > 0:
                 log.info(f"Queue has events waiting ({EVENT_QUEUE.stat().st_size} bytes)")
             return
-        
+
         log.info(f"Processing approved: {reason}")
-        
+
         raw_events = read_queue()
         if not raw_events:
             log.info("Queue empty. Nothing to do.")
             return
 
         log.info(f"Read {len(raw_events)} raw event(s) from queue.")
+
+        raw_events, stale_events = partition_stale_events(raw_events)
+        if stale_events:
+            archive_stale_events(stale_events)
+            log.info(f"Archived {len(stale_events)} stale event(s); excluded from live triage.")
 
         # Normalize events (filter out None returns from excluded normalizations)
         normalized = [n for e in raw_events if (n := normalize(e)) is not None]
@@ -1239,7 +1434,7 @@ def main():
         excluded_count = before_exclude - len(normalized)
         if excluded_count > 0:
             log.info(f"Excluded {excluded_count} events (trusted paths/processes)")
-        
+
         # Deduplicate remaining events
         unique, skipped = deduplicate(normalized)
         log.info(f"After dedup: {len(unique)} unique, {skipped} skipped.")
@@ -1247,7 +1442,7 @@ def main():
         # All events were duplicates - they were already processed in previous runs
         if not unique:
             clear_queue()
-            log.info("Queue cleared (all events were duplicates).")
+            log.info("Queue cleared (no actionable events remained).")
             return
 
         # Calculate dynamic batch size based on current load
@@ -1257,21 +1452,42 @@ def main():
         log.info(f"Dynamic batch size: {dynamic_batch_size} "
                  f"(base: {BATCH_BASE}, load score: {current_load['score']:.0f})")
 
-        # Check if LM Studio was already running (so we don't stop user's session)
-        lm_studio_was_running = is_lm_studio_running()
-
-        # Ensure LM Studio is running and model is loaded
-        if not ensure_lm_studio_ready():
-            log.error("Failed to start LM Studio. Events preserved in queue for next run.")
-            sys.exit(1)
-
         batch = unique[:dynamic_batch_size]
         succeeded, failed = 0, 0
         remaining_events = []  # Events to keep in queue (failed + overflow)
         scored_events = []     # Track successfully scored events for batch operations
+        deterministic, analysis_batch = partition_deterministic_events(batch)
 
-        for i, event in enumerate(batch, 1):
-            log.info(f"[{i}/{len(batch)}] {event.get('source','?')} "
+        for event, score in deterministic:
+            write_scored(event, score)
+            scored_events.append(event)
+            succeeded += 1
+
+        if deterministic:
+            log.info(
+                "Deterministic fast path scored %d/%d exact trusted-maintenance event(s).",
+                len(deterministic),
+                len(batch),
+            )
+
+        if analysis_batch:
+            # This variable also tells final cleanup that this run used LM Studio.
+            lm_studio_was_running = is_lm_studio_running()
+            if not ensure_lm_studio_ready():
+                log.error(
+                    "Failed to start LM Studio. Unscored events preserved for next run."
+                )
+                add_multiple_to_dedup_cache(scored_events)
+                if scored_events:
+                    archive_events(scored_events)
+                overflow = unique[dynamic_batch_size:]
+                clear_queue(keep=analysis_batch + overflow)
+                return
+        else:
+            log.info("Batch required no model analysis; LM Studio was not launched.")
+
+        for i, event in enumerate(analysis_batch, 1):
+            log.info(f"[{i}/{len(analysis_batch)}] {event.get('source','?')} "
                      f"{event.get('event_type','?')} — {event.get('path','?')[:60]}")
 
             # EDR pre-scoring (before LLM)
@@ -1301,7 +1517,7 @@ def main():
 
         # Batch operations: add all scored events to dedup cache at once
         add_multiple_to_dedup_cache(scored_events)
-        
+
         # Batch operations: archive all scored events at once
         if scored_events:
             archive_events(scored_events)
@@ -1323,18 +1539,33 @@ def main():
         # Save successful run time
         save_last_run_time(time.time())
 
-        # Unload model to free RAM (use manager if available)
-        if HAS_LMSTUDIO_MANAGER:
-            lmstudio_manager.unload_model_when_done(MODEL_NAME)
-            log.info("Model unloaded via lmstudio_manager")
-        elif not lm_studio_was_running:
-            # Fallback: stop server if we started it
-            stop_lm_studio_server()
-        else:
-            log.debug("LM Studio was already running - leaving it active")
-
     finally:
+        if HAS_LMSTUDIO_MANAGER and "lm_studio_was_running" in locals():
+            try:
+                manager = get_manager()
+                if manager.unload_model(immediate=True):
+                    log.info("RedSage unloaded after triage batch")
+                if manager.shutdown_lmstudio():
+                    log.info("LM Studio stopped after triage batch")
+            except Exception as exc:
+                log.error(f"Failed to clean up LM Studio after batch: {exc}")
+        elif "lm_studio_was_running" in locals() and not lm_studio_was_running:
+            stop_lm_studio_server()
         release_lock()
 
 if __name__ == "__main__":
     main()
+
+# Periodic LM Studio maintenance (auto-unload)
+_last_maintenance = None
+
+def run_lm_maintenance():
+    """Run LM Studio maintenance every 10 minutes"""
+    global _last_maintenance
+    now = time.time()
+
+    if _last_maintenance is None or (now - _last_maintenance) > 600:  # 10 minutes
+        manager = get_manager()
+        manager.auto_maintenance()
+        _last_maintenance = now
+        log.debug("LM Studio maintenance completed")

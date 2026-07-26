@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Overwatch Network Monitor
+  Monitors network connections for malware-like behavior:
+  - C2 beaconing
+  - Suspicious ports (mining pools, backdoors)
+  - Known-bad IPs/domains
+  - Data exfiltration
+
+  Install:   cp com.velociraptor.networkmonitor.plist ~/Library/LaunchAgents/
+             launchctl load ~/Library/LaunchAgents/com.velociraptor.networkmonitor.plist
+  Uninstall: launchctl unload ~/Library/LaunchAgents/com.velociraptor.networkmonitor.plist
+             rm ~/Library/LaunchAgents/com.velociraptor.networkmonitor.plist
+-->
+<plist version="1.0">
+<dict>
+
+    <key>Label</key>
+    <string>com.velociraptor.networkmonitor</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/python3</string>
+        <string>/Users/YOUR_USERNAME/velociraptor-triage/network_monitor.py</string>
+    </array>
+
+    <key>StandardOutPath</key>
+    <string>/Users/YOUR_USERNAME/velociraptor-triage/network_monitor_stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/YOUR_USERNAME/velociraptor-triage/network_monitor_stderr.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin</string>
+    </dict>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+</dict>
+</plist>

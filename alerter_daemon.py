@@ -25,6 +25,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+from false_positive_exceptions import match_event as match_false_positive_exception
 
 # Try to import yaml for config (optional)
 try:
@@ -366,7 +367,7 @@ def send_discord_alert(title: str, message: str, assessment: dict, config: dict)
 def send_email_alert(title: str, message: str, assessment: dict, config: dict):
     """Send alert via email using SMTP."""
     email_config = config.get("email", {})
-    
+
     if not email_config.get("username") or not email_config.get("password"):
         log.warning("Email credentials not configured")
         return False
@@ -488,19 +489,18 @@ def send_alert(scored_event: dict, config: dict):
     # Send through each enabled channel
     if channels.get("terminal"):
         send_terminal_notification(title, message, assessment)
-    
+
     if channels.get("macos_notification"):
         send_macos_notification(title, message, urgency)
-    
+
     if channels.get("slack"):
         send_slack_alert(title, message, assessment, config)
-    
+
     if channels.get("discord"):
         send_discord_alert(title, message, assessment, config)
-    
+
     if channels.get("email"):
         send_email_alert(title, message, assessment, config)
-
 
 def process_scored_log():
     """Read scored log and alert on new flagged events.
@@ -555,6 +555,24 @@ def process_scored_log():
 
         fp = event_fingerprint(event)
         if fp in alerted:
+            continue
+
+        try:
+            exception = match_false_positive_exception(
+                event.get("original_event", {})
+            )
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            log.error(
+                "False-positive exception registry invalid; alerting normally: %s",
+                exc,
+            )
+            exception = None
+        if exception:
+            log.info(
+                "Alert suppressed by confirmed false-positive exception: %s",
+                exception["id"],
+            )
+            alerted.add(fp)
             continue
 
         assessment = event.get("assessment", {})
